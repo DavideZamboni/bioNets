@@ -1,0 +1,21 @@
+name: mypsns
+
+channels:
+  - conda-forge
+
+dependencies:
+  - python=3.11
+  - pip
+
+  # scientific stack
+  - numpy>=1.26
+  - pandas>=2.2
+  - matplotlib>=3.8
+  - networkx>=3.2
+  - psutil
+  - mdanalysis>=2.7
+  - scipy
+
+  # install package
+  - pip:
+      - -e .

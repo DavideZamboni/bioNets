@@ -1,0 +1,4 @@
+rtp_file,resname,atom_name,atom_type,charge,chargegroup,bonds,sigma,epsilon,mass
+merged,SOL,OW,OT,-0.834,0,HW1 HW2 ,0.315057422683,0.63639,15.9994
+merged,SOL,HW1,HT,0.417,0,OW ,0.0400013524445,0.19246,1.008
+merged,SOL,HW2,HT,0.417,0,OW ,0.0400013524445,0.19246,1.008

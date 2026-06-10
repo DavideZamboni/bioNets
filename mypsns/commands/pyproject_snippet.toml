@@ -1,0 +1,36 @@
+# Snippet to merge into the project's existing pyproject.toml.
+
+[project]
+name = "mypsns"
+version = "0.1.0"
+description = "Protein Structure Network analysis from MD trajectories."
+requires-python = ">=3.11"
+dependencies = [
+    "numpy>=1.26",
+    "pandas>=2.2",
+    "MDAnalysis>=2.7",
+    "networkx>=3.2",
+    "matplotlib>=3.8",
+    "psutil>=5.9",
+    # CLI stack
+    "typer>=0.12",
+    "rich>=13.7",
+    "pydantic>=2.6",
+    "PyYAML>=6.0",
+]
+
+[project.scripts]
+mypsns = "mypsns.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["mypsns*"]
+
+# Optional: pin extras for development
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov",
+    "ruff",
+    "mypy",
+]

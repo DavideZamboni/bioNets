@@ -1,0 +1,666 @@
+"""
+network.py — Network service for myPSNs (energy + time-resolved support).
+
+Workflow
+--------
+1. :meth:`load_static`              – build one residue-interaction graph per
+   (interactors_type × edge_weight_source) by reading the per-type matrices
+   that ``Contacts`` writes (e.g. ``SB_total_energy.dat`` + ``Hbonds_total_energy.dat``
+   + ``HC_total_energy.dat``), transformed (attractive-only or absolute) and
+   summed across the requested targets.
+
+2. :meth:`run_analysis`             – centrality + community detection per graph.
+
+3. :meth:`write_pymol`              – one .pml per
+   (interactors_type × source × node_metric × community_method).
+
+4. :meth:`load_time_resolved_energy` (optional) – read the per-frame energy
+   CSVs that the patched ``get_interaction_energy`` / ``get_hc_energy``
+   produce, aggregate into windows of ``window_size`` frames, and build one
+   graph per (interactors_type × window_start).
+
+5. :meth:`track_communities_over_time` – run community detection on every
+   windowed graph and dump ``community_evolution_*.csv`` with one row per
+   (window_start, residue) — pivot externally for the "community vs time"
+   visualisation.
+
+6. :meth:`write_outputs` / :meth:`get_shortest_paths` / :meth:`apply_filter`
+   — utilities that operate on a chosen graph key.
+
+Graph identifiers
+-----------------
+Static graphs use a 2-tuple key ``(interactors_type, source)``.
+Time-resolved graphs use a 3-tuple ``(interactors_type, source, window_start)``.
+Currently `source` is always ``'energy'`` for time-resolved (only the per-frame
+energy CSVs carry per-frame information).
+"""
+from __future__ import annotations
+
+import logging
+import timeit
+from os import makedirs
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple, Union
+
+import networkx as nx
+import numpy as np
+import pandas as pd
+
+from mypsns.utils.matrix_utilities import (
+    build_chain_map, build_label_map,
+    load_combined_per_type, load_per_frame_energy,
+    matrix_to_pairs, window_per_frame,
+)
+from mypsns.utils.network_utilities import (
+    build_resindex_to_pdb_map,
+    compute_centrality, detect_communities,
+    filter_by_degree, filter_by_weight,
+    write_edge_csv, write_graphml, write_node_csv, write_pymol_session,
+)
+from mypsns.utils.topology_recognition_utilities import get_endtime
+
+pd.options.mode.chained_assignment = None
+log = logging.getLogger(__name__)
+
+_NA_VALUES: List[str] = [
+    "", "#N/A", "#N/A N/A", "#NA", "-1.#IND", "-1.#QNAN",
+    "-NaN", "-nan", "1.#IND", "1.#QNAN", "<NA>", "N/A",
+    "NULL", "NaN", "n/a", "nan", "null",
+]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _build_graph_from_pairs(
+    pairs:    pd.DataFrame,
+    int_df:   pd.DataFrame,
+    weight_col: str = 'weight',
+) -> nx.Graph:
+    """Build a nx.Graph from a (res_1, res_2, weight) table with node attrs
+    pulled from `int_df` (label, chain, resname, resindex)."""
+    G = nx.Graph()
+    label_map = build_label_map(int_df)
+    chain_map = build_chain_map(int_df)
+    uniq = int_df.drop_duplicates('Resindex')
+    resname_map = dict(zip(uniq['Resindex'].astype(int), uniq['resname']))
+    for resix, label in label_map.items():
+        G.add_node(
+            int(resix),
+            label    = label,
+            chain    = chain_map.get(int(resix), ''),
+            resname  = resname_map.get(int(resix), ''),
+            resindex = int(resix),
+        )
+    for _, row in pairs.iterrows():
+        G.add_edge(
+            int(row['res_1']), int(row['res_2']),
+            weight=float(row[weight_col]),
+        )
+    return G
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Network service
+# ═════════════════════════════════════════════════════════════════════════════
+
+class Network:
+    """
+    Residue-interaction network analysis from Contacts output.
+
+    Parameters
+    ----------
+    topology_pdb : str or Path
+        Used to build the Resindex → (chain, PDB resnum) map for correct PyMOL
+        selectors, and as the default reference structure for the PyMOL sessions.
+    general_outpath : str or Path
+        Run root. Must contain ``Interactors/`` and ``Adjacency/``.
+    n_frames : int, optional
+        Total trajectory frames analysed during Contacts. Informational only
+        (logged); analysis derives frame counts directly from the data on disk.
+    na_values : list[str], optional
+        Pandas NA strings.
+    """
+
+    def __init__(
+        self,
+        topology_pdb:    Union[str, Path],
+        general_outpath: Union[str, Path],
+        n_frames:        Optional[int] = None,
+        na_values:       Optional[List[str]] = None,
+    ) -> None:
+        general_outpath = Path(general_outpath)
+        self.topology_pdb     = Path(topology_pdb)
+        self.adjacency_root   = general_outpath / 'Adjacency'
+        self.interactors_root = general_outpath / 'Interactors'
+        self.out              = general_outpath / 'Network'
+        self.nas              = na_values if na_values is not None else list(_NA_VALUES)
+        self.n_frames         = int(n_frames) if n_frames else None
+        self.start            = timeit.default_timer()
+
+        # static
+        self.graphs:         Dict[Tuple[str, str], nx.Graph]        = {}
+        self.centrality_dfs: Dict[Tuple[str, str], pd.DataFrame]    = {}
+        self.community_dfs:  Dict[Tuple[str, str],
+                                  Dict[str, pd.DataFrame]]          = {}
+        # time-resolved
+        self.windowed_graphs: Dict[Tuple[str, str, int], nx.Graph]  = {}
+
+        makedirs(self.out, exist_ok=True)
+        log.info('Network run | adj=%s | interactors=%s | out=%s | n_frames=%s',
+                 self.adjacency_root, self.interactors_root, self.out,
+                 self.n_frames if self.n_frames is not None else 'all')
+
+        # ── whole_topology_interactors ──────────────────────────────────────
+        int_top_path = self.interactors_root / 'whole_topology_interactors.csv'
+        if not int_top_path.exists():
+            raise FileNotFoundError(
+                f'whole_topology_interactors.csv not found in '
+                f'{self.interactors_root.absolute()}.  '
+                'Run Topology_recognition / Interactors first.'
+            )
+        self.int_top = pd.read_csv(int_top_path, header=0, index_col=False,
+                                   na_values=self.nas)
+        log.info('whole_topology_interactors: %d atoms, %d residues',
+                 self.int_top.shape[0], self.int_top['Resindex'].nunique())
+
+        # ── Resindex → (chain, PDB resid) for PyMOL ──────────────────────────
+        try:
+            self.resindex_to_pdb = build_resindex_to_pdb_map(self.topology_pdb)
+            log.debug('Resindex→(chain,resid): %d residues', len(self.resindex_to_pdb))
+        except Exception as e:
+            log.warning('build_resindex_to_pdb_map failed (%s) — PyMOL selectors '
+                        'will fall back to Resindex.', e)
+            self.resindex_to_pdb = {}
+
+    # ═════════════════════════════════════════════════════════════════════════
+    # Static network from contacts matrices
+    # ═════════════════════════════════════════════════════════════════════════
+
+    def load_static(
+        self,
+        interactors_type:    List[str],
+        targets:             List[str],
+        edge_weight_sources: List[str],
+        energy_use_abs:      bool  = False,
+        min_value:           float = 0.0,
+        frame_start:         Optional[int] = None,
+        frame_stop:          Optional[int] = None,
+    ) -> None:
+        """
+        For each (inttype × source), build a graph stored at
+        ``self.graphs[(inttype, source)]``.
+
+        Two paths
+        ---------
+        * Fast (no frame range): reads the per-type matrices Contacts wrote
+          (e.g. ``SB_total_energy.dat``) and sums across ``targets``.
+        * Per-frame (frame_start and/or frame_stop set): re-aggregates from
+          the per-frame energy CSVs restricted to ``[frame_start, frame_stop)``.
+          Energy weight = ``sum(per-frame weight) / n_frames_eff``.
+          Persistency weight = ``Σ_target (unique_frames_per_pair / n_frames_eff)``.
+
+        Parameters
+        ----------
+        interactors_type : list of {'q_interactors', 'named_interactors'}
+            Sub-folders of Adjacency/ to consume.
+        targets : list of {'Salt_bridges', 'HBonds', 'HCs'}
+            Contact types contributing to each graph.
+        edge_weight_sources : list of {'persistency', 'energy'}
+            One graph is built per source.
+        energy_use_abs : bool
+            False (default) → attractive-only: weight = max(0, -E).
+            True            → absolute:        weight = |E|.
+        min_value : float
+            Drop edges whose summed weight is at or below this.
+        frame_start, frame_stop : int, optional
+            If either is set, re-aggregate from per-frame CSVs over
+            ``[frame_start, frame_stop)``.
+        """
+        if frame_start is not None or frame_stop is not None:
+            return self._load_static_from_per_frame(
+                interactors_type, targets, edge_weight_sources,
+                energy_use_abs, min_value, frame_start, frame_stop,
+            )
+
+        start = timeit.default_timer()
+
+        for inttype in interactors_type:
+            folder = self.adjacency_root / inttype
+            if not folder.exists():
+                log.warning('load_static: %s not found — skipped', folder)
+                continue
+            for source in edge_weight_sources:
+                mat, labels = load_combined_per_type(
+                    folder, targets=targets, source=source,
+                    use_abs=energy_use_abs,
+                )
+                if mat is None:
+                    log.warning('load_static: no matrices for %s/%s — skipped',
+                                inttype, source)
+                    continue
+                pairs = matrix_to_pairs(mat, labels, value_name='weight',
+                                        min_value=min_value)
+                G = _build_graph_from_pairs(pairs, self.int_top, weight_col='weight')
+                self.graphs[(inttype, source)] = G
+                log.info('  %s/%s graph: %d nodes, %d edges',
+                         inttype, source, G.number_of_nodes(), G.number_of_edges())
+
+        proc_time, total_time = get_endtime(start, self.start)
+        log.info('load_static complete | took %s (h:m:s), total %s (h:m:s)',
+                 proc_time, total_time)
+
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _load_static_from_per_frame(
+        self,
+        interactors_type:    List[str],
+        targets:             List[str],
+        edge_weight_sources: List[str],
+        energy_use_abs:      bool,
+        min_value:           float,
+        frame_start:         Optional[int],
+        frame_stop:          Optional[int],
+    ) -> None:
+        """Frame-range path for load_static — uses per-frame energy CSVs."""
+        start = timeit.default_timer()
+
+        for inttype in interactors_type:
+            folder = self.adjacency_root / inttype
+            if not folder.exists():
+                log.warning('load_static (per-frame): %s missing — skipped', folder)
+                continue
+            df = load_per_frame_energy(folder, targets=targets, use_abs=energy_use_abs)
+            if df.empty:
+                log.warning('load_static (per-frame): no per-frame energy CSVs '
+                            'under %s — skipped (re-run contacts with the '
+                            'streaming-energy patch?)', folder)
+                continue
+
+            if frame_start is not None:
+                df = df[df['frame'] >= frame_start]
+            if frame_stop is not None:
+                df = df[df['frame'] <  frame_stop]
+            if df.empty:
+                log.warning('load_static (per-frame): frame range [%s, %s) '
+                            'excluded all data under %s — skipped',
+                            frame_start, frame_stop, folder)
+                continue
+
+            # canonical order
+            swap = df['res_1'] > df['res_2']
+            df.loc[swap, ['res_1', 'res_2']] = df.loc[swap, ['res_2', 'res_1']].values
+
+            # effective frame count for normalisation
+            eff_start = frame_start if frame_start is not None else int(df['frame'].min())
+            eff_stop  = frame_stop  if frame_stop  is not None else int(df['frame'].max()) + 1
+            n_frames_eff = max(1, eff_stop - eff_start)
+            log.info('  %s: per-frame aggregation, frames [%d, %d)  (n=%d)',
+                     inttype, eff_start, eff_stop, n_frames_eff)
+
+            for source in edge_weight_sources:
+                if source == 'energy':
+                    agg = df.groupby(['res_1', 'res_2'], as_index=False)['weight'].sum()
+                    agg['weight'] = agg['weight'] / n_frames_eff
+                elif source == 'persistency':
+                    pers = (df.groupby(['target', 'res_1', 'res_2'])['frame']
+                              .nunique().reset_index(name='hit'))
+                    pers['weight'] = pers['hit'] / n_frames_eff
+                    agg = pers.groupby(['res_1', 'res_2'], as_index=False)['weight'].sum()
+                else:
+                    log.warning('load_static (per-frame): unknown source %r — skipped',
+                                source)
+                    continue
+
+                agg = agg[agg['weight'] > min_value]
+                if agg.empty:
+                    log.warning('  %s/%s: no edges above min_value=%g',
+                                inttype, source, min_value)
+                    continue
+                G = _build_graph_from_pairs(agg, self.int_top, weight_col='weight')
+                self.graphs[(inttype, source)] = G
+                log.info('  %s/%s graph (per-frame): %d nodes, %d edges',
+                         inttype, source, G.number_of_nodes(), G.number_of_edges())
+
+        proc_time, total_time = get_endtime(start, self.start)
+        log.info('load_static (per-frame) complete | took %s (h:m:s), total %s (h:m:s)',
+                 proc_time, total_time)
+
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def run_analysis(
+        self,
+        community_methods: Optional[List[str]] = None,
+        community_seed:    int                  = 42,
+    ) -> None:
+        """Centrality + community detection, per static graph."""
+        if not self.graphs:
+            raise RuntimeError('run_analysis() called before load_static()')
+        if community_methods is None:
+            community_methods = ['louvain']
+
+        start = timeit.default_timer()
+
+        for key, G in self.graphs.items():
+            inttype, source = key
+            cdf_centrality = compute_centrality(G)
+            self.centrality_dfs[key] = cdf_centrality
+            self.community_dfs[key] = {}
+            for method in community_methods:
+                cdf, n_comm = detect_communities(G, method=method, seed=community_seed)
+                self.community_dfs[key][method] = cdf
+                log.info('  %s/%s: %s → %d communities',
+                         inttype, source, method, n_comm)
+                nout = write_node_csv(
+                    G, cdf_centrality, cdf, self.out,
+                    filename=f'nodes_{inttype}_{source}_{method}.csv',
+                )
+                log.info('    nodes CSV: %s', nout)
+            eout = write_edge_csv(
+                G, self.out, filename=f'edges_{inttype}_{source}.csv',
+            )
+            log.info('    edges CSV: %s', eout)
+
+        proc_time, total_time = get_endtime(start, self.start)
+        log.info('run_analysis complete | took %s (h:m:s), total %s (h:m:s)',
+                 proc_time, total_time)
+
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def write_pymol(
+        self,
+        node_metrics:      List[str],
+        community_methods: Optional[List[str]] = None,
+        sphere_scale:      float = 2.0,
+        stick_scale:       float = 0.5,
+        reference_pdb:     Optional[Union[str, Path]] = None,
+    ) -> List[Path]:
+        """One .pml per (inttype × source × node_metric × community_method)."""
+        if not self.graphs:
+            raise RuntimeError('write_pymol() called before load_static()')
+        if not self.centrality_dfs:
+            raise RuntimeError('write_pymol() called before run_analysis()')
+
+        ref_pdb = Path(reference_pdb) if reference_pdb is not None else self.topology_pdb
+        if community_methods is None:
+            first = next(iter(self.community_dfs.values()), {})
+            community_methods = list(first.keys())
+
+        out_files: List[Path] = []
+        for key, G in self.graphs.items():
+            inttype, source = key
+            cdf_centrality = self.centrality_dfs.get(key)
+            if cdf_centrality is None:
+                continue
+            for nm in node_metrics:
+                if nm not in cdf_centrality.columns:
+                    log.warning('node_metric %r not in centrality for %s/%s — skipped',
+                                nm, inttype, source)
+                    continue
+                for cm in community_methods:
+                    cdf_comm = self.community_dfs.get(key, {}).get(cm)
+                    if cdf_comm is None:
+                        log.warning('community %r not run for %s/%s — skipped',
+                                    cm, inttype, source)
+                        continue
+                    p = write_pymol_session(
+                        G                = G,
+                        pdb_path         = ref_pdb,
+                        outpath          = self.out,
+                        node_metric      = nm,
+                        centrality_df    = cdf_centrality,
+                        community_df     = cdf_comm,
+                        community_method = cm,
+                        resindex_to_pdb  = self.resindex_to_pdb,
+                        sphere_scale     = sphere_scale,
+                        stick_scale      = stick_scale,
+                        filename         = f'network_{inttype}_{source}_{nm}_{cm}.pml',
+                    )
+                    out_files.append(p)
+                    log.info('PyMOL: %s', p.name)
+        return out_files
+
+    # ═════════════════════════════════════════════════════════════════════════
+    # Time-resolved
+    # ═════════════════════════════════════════════════════════════════════════
+
+    def load_time_resolved_energy(
+        self,
+        interactors_type: List[str],
+        targets:          List[str],
+        window_size:      int,
+        stride:           Optional[int] = None,
+        energy_use_abs:   bool  = False,
+        min_value:        float = 0.0,
+        frame_start:      Optional[int] = None,
+        frame_stop:       Optional[int] = None,
+    ) -> None:
+        """
+        Read the per-frame energy CSVs (one per merged file, sitting in the
+        target sub-folder), window-aggregate, and build one graph per
+        ``(inttype, 'energy', window_start)``.
+
+        Parameters
+        ----------
+        window_size : int
+            Frames per window.
+        stride : int, optional
+            Step between windows (defaults to ``window_size`` — non-overlapping).
+        energy_use_abs : bool
+            Per-row weight: ``|energy_total|`` if True, else ``max(0, -energy_total)``.
+        min_value : float
+            Drop edges (per window) whose total summed weight is at or below this.
+        frame_start, frame_stop : int, optional
+            Restrict the per-frame data to ``[frame_start, frame_stop)``. Either
+            or both may be None — None means "no bound on that side". When both
+            are None (default), all frames in the CSVs are analysed.
+        """
+        start = timeit.default_timer()
+        stride = stride or window_size
+
+        for inttype in interactors_type:
+            folder = self.adjacency_root / inttype
+            if not folder.exists():
+                log.warning('load_time_resolved_energy: %s missing — skipped', folder)
+                continue
+            df = load_per_frame_energy(folder, targets=targets, use_abs=energy_use_abs)
+            if df.empty:
+                log.warning('load_time_resolved_energy: no per-frame energy CSVs '
+                            'under %s — skipped (did you re-run contacts after '
+                            'the streaming-energy patch?)', folder)
+                continue
+
+            # ── frame-range filter ──────────────────────────────────────────
+            n_before = df['frame'].nunique()
+            if frame_start is not None:
+                df = df[df['frame'] >= frame_start]
+            if frame_stop is not None:
+                df = df[df['frame'] <  frame_stop]
+            if df.empty:
+                log.warning('load_time_resolved_energy: frame range '
+                            '[%s, %s) excluded all data under %s — skipped',
+                            frame_start, frame_stop, folder)
+                continue
+            n_after = df['frame'].nunique()
+            if frame_start is not None or frame_stop is not None:
+                log.info('  %s: frame range [%s, %s) → %d/%d frames retained',
+                         inttype, frame_start, frame_stop, n_after, n_before)
+
+            # canonical order: res_1 < res_2 (already done by writer, but be safe)
+            swap = df['res_1'] > df['res_2']
+            df.loc[swap, ['res_1', 'res_2']] = df.loc[swap, ['res_2', 'res_1']].values
+
+            # window aggregation (sum weight + n_contacts within each window/pair)
+            wdf = window_per_frame(
+                df, window_size=window_size, stride=stride,
+                value_cols=['weight', 'n_contacts'],
+            )
+            log.info('  %s: %d frames → %d (window,pair) rows',
+                     inttype, df['frame'].nunique(), len(wdf))
+
+            for window_start, gdf in wdf.groupby('window_start'):
+                pairs = gdf[['res_1', 'res_2', 'weight']]
+                pairs = pairs[pairs['weight'] > min_value]
+                if pairs.empty:
+                    continue
+                G = _build_graph_from_pairs(pairs, self.int_top, weight_col='weight')
+                self.windowed_graphs[(inttype, 'energy', int(window_start))] = G
+
+        proc_time, total_time = get_endtime(start, self.start)
+        log.info('load_time_resolved_energy: %d windowed graphs | '
+                 'took %s (h:m:s), total %s (h:m:s)',
+                 len(self.windowed_graphs), proc_time, total_time)
+
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def track_communities_over_time(
+        self,
+        community_methods: Optional[List[str]] = None,
+        community_seed:    int                  = 42,
+        min_window_edges:  int                  = 0,
+    ) -> Dict[Tuple[str, str, str], Path]:
+        """
+        Detect communities on every windowed graph and write a tidy CSV per
+        (inttype × source × community_method):
+
+            community_evolution_<inttype>_<source>_<method>.csv
+              window_start, resindex, label, community
+
+        Use this as the input for the "community vs time" pivot/heatmap.
+        """
+        if not self.windowed_graphs:
+            raise RuntimeError('track_communities_over_time() called before '
+                               'load_time_resolved_energy()')
+        if community_methods is None:
+            community_methods = ['louvain']
+
+        start = timeit.default_timer()
+        # group windowed_graphs by (inttype, source)
+        by_run: Dict[Tuple[str, str], List[Tuple[int, nx.Graph]]] = {}
+        for (inttype, source, ws), G in self.windowed_graphs.items():
+            by_run.setdefault((inttype, source), []).append((ws, G))
+
+        written: Dict[Tuple[str, str, str], Path] = {}
+        label_map = build_label_map(self.int_top)
+
+        for (inttype, source), window_list in by_run.items():
+            window_list.sort(key=lambda x: x[0])
+            for method in community_methods:
+                rows: List[Dict] = []
+                for ws, G in window_list:
+                    if G.number_of_edges() < min_window_edges:
+                        continue
+                    cdf, n_comm = detect_communities(
+                        G, method=method, seed=community_seed
+                    )
+                    log.debug('  %s/%s window=%d (%s): %d communities',
+                              inttype, source, ws, method, n_comm)
+                    for _, row in cdf.iterrows():
+                        rows.append({
+                            'window_start': int(ws),
+                            'resindex':     int(row['resindex']),
+                            'label':        label_map.get(int(row['resindex']),
+                                                          str(int(row['resindex']))),
+                            'community':    int(row['community']),
+                        })
+                if not rows:
+                    continue
+                out_df = pd.DataFrame(rows)
+                out_path = self.out / f'community_evolution_{inttype}_{source}_{method}.csv'
+                out_df.to_csv(out_path, index=False)
+                written[(inttype, source, method)] = out_path
+                log.info('community evolution: %s (%d (window,residue) rows)',
+                         out_path.name, len(out_df))
+
+        proc_time, total_time = get_endtime(start, self.start)
+        log.info('track_communities_over_time complete | '
+                 'took %s (h:m:s), total %s (h:m:s)',
+                 proc_time, total_time)
+        return written
+
+    # ═════════════════════════════════════════════════════════════════════════
+    # Auxiliary outputs
+    # ═════════════════════════════════════════════════════════════════════════
+
+    def write_outputs(
+        self,
+        graphml_per_source: bool = True,
+    ) -> List[Path]:
+        """One GraphML per static graph (or only the first if disabled)."""
+        if not self.graphs:
+            raise RuntimeError('write_outputs() called before load_static()')
+        out_paths: List[Path] = []
+
+        for key, G in self.graphs.items():
+            inttype, source = key
+            H = G.copy()
+            if key in self.centrality_dfs:
+                for _, row in self.centrality_dfs[key].iterrows():
+                    n = int(row['resindex'])
+                    if H.has_node(n):
+                        H.nodes[n]['betweenness_centrality'] = row['betweenness_centrality']
+                        H.nodes[n]['closeness_centrality']   = row['closeness_centrality']
+                        H.nodes[n]['degree_centrality']      = row['degree_centrality']
+                        H.nodes[n]['weighted_degree']        = row['weighted_degree']
+            if key in self.community_dfs and self.community_dfs[key]:
+                first_method = next(iter(self.community_dfs[key]))
+                comm_map = dict(zip(
+                    self.community_dfs[key][first_method]['resindex'],
+                    self.community_dfs[key][first_method]['community'],
+                ))
+                for n in H.nodes():
+                    H.nodes[n]['community'] = int(comm_map.get(int(n), -1))
+
+            out_path = write_graphml(
+                H, self.out, filename=f'network_{inttype}_{source}.graphml',
+            )
+            out_paths.append(out_path)
+            log.info('GraphML: %s', out_path)
+            if not graphml_per_source:
+                break
+        return out_paths
+
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def get_shortest_paths(
+        self,
+        key:    Tuple[str, str],
+        source: Optional[Union[int, List[int]]] = None,
+        target: Optional[Union[int, List[int]]] = None,
+        filename: Optional[str] = None,
+    ) -> pd.DataFrame:
+        """
+        Weighted shortest paths on one chosen static graph.
+        ``key`` is ``(interactors_type, edge_weight_source)``.
+        """
+        from mypsns.utils.network_utilities import shortest_paths as _sp
+        if key not in self.graphs:
+            raise KeyError(f'no static graph for {key!r}. Available: {list(self.graphs)}')
+        df = _sp(self.graphs[key], source=source, target=target)
+        if filename is None:
+            inttype, src = key
+            filename = f'shortest_paths_{inttype}_{src}.csv'
+        out = self.out / filename
+        df.to_csv(out, header=True, index=False)
+        log.info('shortest_paths: %d pairs → %s', len(df), out)
+        return df
+
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def apply_filter(
+        self,
+        key:           Tuple[str, str],
+        min_frequency: Optional[float] = None,
+        min_degree:    Optional[int]   = None,
+    ) -> nx.Graph:
+        """Filtered copy of one static graph; ``self.graphs[key]`` untouched."""
+        if key not in self.graphs:
+            raise KeyError(f'no static graph for {key!r}')
+        H = self.graphs[key].copy()
+        if min_frequency is not None:
+            H = filter_by_weight(H, min_frequency)
+        if min_degree is not None:
+            H = filter_by_degree(H, min_degree)
+        log.info('apply_filter %s: min_w=%s min_d=%s → %d nodes, %d edges',
+                 key, min_frequency, min_degree,
+                 H.number_of_nodes(), H.number_of_edges())
+        return H

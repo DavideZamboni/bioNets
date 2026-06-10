@@ -1,0 +1,75 @@
+# myPSNs run configuration
+#
+# Top-level keys map to PipelineConfig fields; per-stage keys nest below.
+# CLI options always override the values you put here.
+# Run `mypsns validate --config config.yaml` to check this file.
+
+# ── General ─────────────────────────────────────────────────────────────────
+topology:    /data/protein.pdb
+trajectory:  /data/traj.xtc              # only needed for `contacts` and `run`
+forcefield:  /forcefields/amber99sb.ff
+outpath:     /scratch/mypsns_run01
+log_file:    /scratch/mypsns_run01/run.log
+
+
+# ── Forcefield reader ───────────────────────────────────────────────────────
+ff_reader:
+  nonbonded_name:      ffnonbonded.itp
+  additional_residues: true
+
+
+# ── Topology recognition ────────────────────────────────────────────────────
+topology_recognition:
+  max_to_check: -1                       # -1 = inspect every ff entry
+  verbose:      false
+
+
+# ── Interactors ─────────────────────────────────────────────────────────────
+interactors:
+  modes:
+    - named_interactors
+    # - q_interactors
+
+  # HBond
+  max_DA_charge: -0.3
+  min_H_charge:   0.3
+  DA_masses:    [14, 16, 19]
+
+  # Salt bridge
+  min_abs_charge: 0.75
+
+  # Hydrophobic cluster
+  max_abs_charge:        0.27
+  max_num_heavy_ats:     3
+  min_bonds_to_charged:  3
+
+  verbose: false
+
+
+# ── Contacts ────────────────────────────────────────────────────────────────
+contacts:
+  # parallelization
+  nc:         8
+  ram_thresh: 80
+  nframes:    500
+
+  # trajectory window
+  beg_frm: 0
+  end_frm: -1
+
+  # selectors
+  interactors_type:
+    - named_interactors
+  targets:
+    - HBonds
+    - Salt_bridges
+    - HCs
+
+  subject_chains:     null               # null = auto-detect polymer chains
+  surrounding_chains: null               # null = all detected chains
+
+  # geometric cutoffs
+  d_a_dist:   4.5
+  angle:    150.0
+  sb_cutoff:  3.5
+  hc_cutoff:  5.5

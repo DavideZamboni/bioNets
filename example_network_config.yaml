@@ -1,0 +1,62 @@
+# =============================================================================
+# myPSNs — basic network configuration
+# Run with:  mypsns network --config network_basic.yaml
+# =============================================================================
+#
+# This builds residue-interaction networks from Contacts output and renders
+# them as PyMOL sessions. It assumes `mypsns ff_reader`, `topology_recognition`,
+# `interactors` and `contacts` have already produced their outputs under
+# `outpath`.
+
+# ── Top-level (PipelineConfig requires these for any stage) ─────────────────
+topology:   /path/to/system.gro                # .gro / .pdb / .tpr
+forcefield: /path/to/ff/ffnonbonded.itp        # nonbonded forcefield file
+outpath:    /path/to/run_output                # must contain Interactors/ + Adjacency/
+
+
+network:
+  # ── Frames (required) ──────────────────────────────────────────────────────
+  n_frames: 10000                              # trajectory frames analysed during Contacts
+
+  # ── Which contacts to consume ──────────────────────────────────────────────
+  interactors_type:                            # sub-folder(s) of Adjacency/
+    - q_interactors                            #   charge-based schema
+    # - named_interactors                      #   group-name-based schema
+  targets:                                     # contact types contributing
+    - HBonds
+    - Salt_bridges
+    - HCs
+
+  # ── Edge weight: build one network per source ──────────────────────────────
+  edge_weight_sources:
+    - persistency                              # *_adjacency.dat  (frequency, 0..1)
+    - energy                                   # *_total_energy.dat (LJ + Coulomb, kJ/mol)
+  energy_use_abs: false                        # false → only attractive: w = max(0, -E)
+                                               # true  → |E|, also counts repulsive
+
+  # ── Output metrics (one .pml per node_metric × community_method × source) ─
+  node_metrics:
+    - betweenness_centrality
+    # other choices: degree | weighted_degree | degree_centrality | closeness_centrality
+  community_methods:
+    - louvain
+    # other choices: greedy_modularity | label_propagation | connected_components
+  community_seed: 42
+
+  # ── Filters ────────────────────────────────────────────────────────────────
+  min_frequency: 0.0                           # drop edges with summed weight ≤ this
+  min_degree:    0                             # drop nodes with degree < this
+
+  # ── PyMOL rendering ────────────────────────────────────────────────────────
+  # reference_pdb: /path/to/representative.pdb # default: --topology
+  sphere_scale: 2.0                            # max CA-sphere vdw radius (Å)
+  stick_scale:  0.5                            # max edge dash radius (Å)
+
+  # ── Optional extra outputs ─────────────────────────────────────────────────
+  write_graphml:  false                        # one GraphML per static network
+  shortest_paths: false                        # all-pairs shortest paths CSV
+
+  # ── Time-resolved community tracking (uncomment to enable) ────────────────
+  # window_size:   500                         # frames per window
+  # window_stride: 500                         # step between windows
+                                               # → writes community_evolution_*.csv

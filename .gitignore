@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# myPSNs runtime outputs — keep small fixtures, ignore real runs
+**/Adjacency/
+**/Interactors/
+**/Network/
+**/Topology_recognition/
+**/forcefield/
+*.log
+
+# MD data — usually too big for git
+*.xtc
+*.trr
+*.dcd
+*.edr
