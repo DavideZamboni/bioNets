@@ -199,7 +199,7 @@ def parse_ter_definition(line: str, replace: bool, add: bool, delete: bool,
 
 def read_replace5_entries(ll:List[str], residues: dict[str, List[str]], myfname: str, myTername: str, toremove: str) -> dict:
     for k in residues.keys():
-        log.debug(k, residues[k])
+        log.debug(f"{k}, {residues[k]}")
     
     residues["tdb_file"].append(myfname)
     residues['resname'].append(myTername)

@@ -49,13 +49,14 @@ import pandas as pd
 from mypsns.utils.matrix_utilities import (
     build_chain_map, build_label_map,
     load_combined_per_type, load_per_frame_energy,
-    matrix_to_pairs, window_per_frame,
+    matrix_to_pairs, strength_to_percentage, window_per_frame,
 )
 from mypsns.utils.network_utilities import (
     build_resindex_to_pdb_map,
     compute_centrality, detect_communities,
     filter_by_degree, filter_by_weight,
-    write_edge_csv, write_graphml, write_node_csv, write_pymol_session,
+    write_edge_csv, write_graphml, write_node_csv,
+    write_pymol_nodes, write_pymol_communities,
 )
 from mypsns.utils.general_utilities import get_endtime
 from mypsns.utils.contacts_utilities import assemble_full_interactors
@@ -171,6 +172,22 @@ class Network:
                  self.adjacency_root, self.interactors_root, self.out,
                  self.n_frames if self.n_frames is not None else 'all')
 
+        # ── Reference structure for PyMOL selectors ──────────────────────────
+        # The graph's residue indices / chains were built against the CORRECTED
+        # topology Contacts wrote (Adjacency/<name>_correct.pdb): Resindex stamped
+        # as resid, chains re-stamped to match. Selectors (chain X and resi N)
+        # only resolve against that structure, so prefer it over whatever the
+        # user passed in. Fall back to the supplied topology if none is found.
+        self.reference_pdb = self._find_corrected_pdb()
+        if self.reference_pdb is not None:
+            log.info('Using corrected topology for PyMOL: %s', self.reference_pdb)
+        else:
+            self.reference_pdb = self.topology_pdb
+            log.warning('No *_correct.pdb found in %s — falling back to the '
+                        'supplied topology (%s). PyMOL edges/nodes may not '
+                        'resolve if its chains/resids differ from the network.',
+                        self.adjacency_root, self.topology_pdb)
+
         # ── Interactors table ────────────────────────────────────────────────
         # Reconstructed in memory from the three normalised files Interactors
         # writes (found_topologies/<variant>.csv, residue_index.csv,
@@ -198,12 +215,39 @@ class Network:
 
         # ── Resindex → (chain, PDB resid) for PyMOL ──────────────────────────
         try:
-            self.resindex_to_pdb = build_resindex_to_pdb_map(self.topology_pdb)
+            self.resindex_to_pdb = build_resindex_to_pdb_map(self.reference_pdb)
             log.debug('Resindex→(chain,resid): %d residues', len(self.resindex_to_pdb))
         except Exception as e:
             log.warning('build_resindex_to_pdb_map failed (%s) — PyMOL selectors '
                         'will fall back to Resindex.', e)
             self.resindex_to_pdb = {}
+
+    def _find_corrected_pdb(self) -> Optional[Path]:
+        """Locate the corrected topology Contacts wrote, ``<name>_correct.pdb``
+        under ``Adjacency/``.
+
+        Preference order:
+          1. ``Adjacency/<supplied_topology_stem>_correct.pdb`` (the exact match
+             for the structure this pipeline was run on);
+          2. any single ``Adjacency/*_correct.pdb`` if exactly one exists;
+          3. None (caller falls back to the supplied topology).
+        """
+        if not self.adjacency_root.exists():
+            return None
+        # 1. exact stem match
+        stem = self.topology_pdb.stem
+        exact = self.adjacency_root / f'{stem}_correct.pdb'
+        if exact.exists():
+            return exact
+        # 2. unique *_correct.pdb
+        candidates = sorted(self.adjacency_root.glob('*_correct.pdb'))
+        if len(candidates) == 1:
+            return candidates[0]
+        if len(candidates) > 1:
+            log.warning('Multiple *_correct.pdb in %s (%s) — cannot pick '
+                        'unambiguously; using supplied topology.',
+                        self.adjacency_root, [c.name for c in candidates])
+        return None
 
     # ═════════════════════════════════════════════════════════════════════════
     # Static network from contacts matrices
@@ -235,7 +279,7 @@ class Network:
 
         Parameters
         ----------
-        interactors_type : list of {'q', 'named'}
+        interactors_type : list of {'q_interactors', 'named_interactors'}
             Sub-folders of Adjacency/ to consume.
         targets : list of {'Salt_bridges', 'HBonds', 'HCs'}
             Contact types contributing to each graph.
@@ -246,10 +290,12 @@ class Network:
             True            → absolute:        weight = |E|.
         min_persistency : float
             Persistency-graph edge threshold (percent, 0..100). Edges with
-            summed weight ≤ this are dropped.
+            weight ≤ this are dropped.
         min_energy : float
-            Energy-graph edge threshold (kJ/mol, post-transform). Edges with
-            summed weight ≤ this are dropped.
+            Energy-graph edge threshold (percent of the strongest edge, 0..100).
+            Energy strengths are normalised to 0..100 before thresholding, the
+            same scale the energy elbow/degree plots use. Edges with weight ≤
+            this are dropped.
         frame_start, frame_stop : int, optional
             If either is set, re-aggregate from per-frame CSVs over
             ``[frame_start, frame_stop)``.
@@ -277,12 +323,17 @@ class Network:
                     log.warning('load_static: no matrices for %s/%s — skipped',
                                 inttype, source)
                     continue
+                # energy is normalised to 0..100 "% of strongest edge" so its
+                # threshold and edge weights are on the same scale as the energy
+                # elbow/degree plots (and as persistency).
+                if source == 'energy':
+                    mat = strength_to_percentage(mat)
                 min_value = _threshold_for_source(source, min_persistency, min_energy)
                 pairs = matrix_to_pairs(mat, labels, value_name='weight',
                                         min_value=min_value)
                 G = _build_graph_from_pairs(pairs, self.int_top, weight_col='weight')
                 self.graphs[(inttype, source)] = G
-                log.info('  %s/%s graph: %d nodes, %d edges (min_value=%g)',
+                log.info('  %s/%s graph: %d nodes, %d edges (min_%%=%g)',
                          inttype, source, G.number_of_nodes(),
                          G.number_of_edges(), min_value)
 
@@ -348,6 +399,12 @@ class Network:
                 if source == 'energy':
                     agg = df.groupby(['res_1', 'res_2'], as_index=False)['weight'].sum()
                     agg['weight'] = agg['weight'] / n_frames_eff
+                    # normalise to 0..100 "% of strongest edge" (matches matrix path)
+                    wmax = agg['weight'].max() if len(agg) else 0.0
+                    if wmax > 0:
+                        agg['weight'] = 100.0 * agg['weight'] / wmax
+                    else:
+                        agg['weight'] = 0.0
                 elif source == 'persistency':
                     pers = (df.groupby(['target', 'res_1', 'res_2'])['frame']
                               .nunique().reset_index(name='hit'))
@@ -362,12 +419,12 @@ class Network:
                 min_value = _threshold_for_source(source, min_persistency, min_energy)
                 agg = agg[agg['weight'] > min_value]
                 if agg.empty:
-                    log.warning('  %s/%s: no edges above min_value=%g',
+                    log.warning('  %s/%s: no edges above min_%%=%g',
                                 inttype, source, min_value)
                     continue
                 G = _build_graph_from_pairs(agg, self.int_top, weight_col='weight')
                 self.graphs[(inttype, source)] = G
-                log.info('  %s/%s graph (per-frame): %d nodes, %d edges (min_value=%g)',
+                log.info('  %s/%s graph (per-frame): %d nodes, %d edges (min_%%=%g)',
                          inttype, source, G.number_of_nodes(),
                          G.number_of_edges(), min_value)
 
@@ -395,18 +452,22 @@ class Network:
             cdf_centrality = compute_centrality(G)
             self.centrality_dfs[key] = cdf_centrality
             self.community_dfs[key] = {}
+
+            csv_dir = self.out / inttype / 'csv'
+            makedirs(csv_dir, exist_ok=True)
+
             for method in community_methods:
                 cdf, n_comm = detect_communities(G, method=method, seed=community_seed)
                 self.community_dfs[key][method] = cdf
                 log.info('  %s/%s: %s → %d communities',
                          inttype, source, method, n_comm)
                 nout = write_node_csv(
-                    G, cdf_centrality, cdf, self.out,
-                    filename=f'nodes_{inttype}_{source}_{method}.csv',
+                    G, cdf_centrality, cdf, csv_dir,
+                    filename=f'nodes_{source}_{method}.csv',
                 )
                 log.info('    nodes CSV: %s', nout)
             eout = write_edge_csv(
-                G, self.out, filename=f'edges_{inttype}_{source}.csv',
+                G, csv_dir, filename=f'edges_{source}.csv',
             )
             log.info('    edges CSV: %s', eout)
 
@@ -424,13 +485,26 @@ class Network:
         stick_scale:       float = 0.5,
         reference_pdb:     Optional[Union[str, Path]] = None,
     ) -> List[Path]:
-        """One .pml per (inttype × source × node_metric × community_method)."""
+        """
+        Write PyMOL scripts, separating node-centrality and community renders.
+
+        Layout under ``Network/``::
+
+            <inttype>/node_metrics/<source>_<metric>.pml
+            <inttype>/community_metrics/<source>_<method>.pml
+
+        Each node-metric file shows CA spheres scaled by that one metric; each
+        community file shows CA spheres coloured by that one partition. Both
+        always draw the gray network edges underneath for connectivity. Node and
+        community renders are independent, so the count is
+        (metrics + methods) per (inttype × source), not their product.
+        """
         if not self.graphs:
             raise RuntimeError('write_pymol() called before load_static()')
         if not self.centrality_dfs:
             raise RuntimeError('write_pymol() called before run_analysis()')
 
-        ref_pdb = Path(reference_pdb) if reference_pdb is not None else self.topology_pdb
+        ref_pdb = Path(reference_pdb) if reference_pdb is not None else self.reference_pdb
         if community_methods is None:
             first = next(iter(self.community_dfs.values()), {})
             community_methods = list(first.keys())
@@ -441,32 +515,52 @@ class Network:
             cdf_centrality = self.centrality_dfs.get(key)
             if cdf_centrality is None:
                 continue
+
+            node_dir = self.out / inttype / 'node_metrics'
+            comm_dir = self.out / inttype / 'community_metrics'
+            makedirs(node_dir, exist_ok=True)
+            makedirs(comm_dir, exist_ok=True)
+
+            # ── one file per node metric ─────────────────────────────────────
             for nm in node_metrics:
                 if nm not in cdf_centrality.columns:
                     log.warning('node_metric %r not in centrality for %s/%s — skipped',
                                 nm, inttype, source)
                     continue
-                for cm in community_methods:
-                    cdf_comm = self.community_dfs.get(key, {}).get(cm)
-                    if cdf_comm is None:
-                        log.warning('community %r not run for %s/%s — skipped',
-                                    cm, inttype, source)
-                        continue
-                    p = write_pymol_session(
-                        G                = G,
-                        pdb_path         = ref_pdb,
-                        outpath          = self.out,
-                        node_metric      = nm,
-                        centrality_df    = cdf_centrality,
-                        community_df     = cdf_comm,
-                        community_method = cm,
-                        resindex_to_pdb  = self.resindex_to_pdb,
-                        sphere_scale     = sphere_scale,
-                        stick_scale      = stick_scale,
-                        filename         = f'network_{inttype}_{source}_{nm}_{cm}.pml',
-                    )
-                    out_files.append(p)
-                    log.info('PyMOL: %s', p.name)
+                p = write_pymol_nodes(
+                    G               = G,
+                    pdb_path        = ref_pdb,
+                    outpath         = node_dir,
+                    node_metric     = nm,
+                    centrality_df   = cdf_centrality,
+                    resindex_to_pdb = self.resindex_to_pdb,
+                    sphere_scale    = sphere_scale,
+                    stick_scale     = stick_scale,
+                    filename        = f'{source}_{nm}.pml',
+                )
+                out_files.append(p)
+                log.info('PyMOL node metric: %s/%s', inttype, p.name)
+
+            # ── one file per community method ────────────────────────────────
+            for cm in community_methods:
+                cdf_comm = self.community_dfs.get(key, {}).get(cm)
+                if cdf_comm is None:
+                    log.warning('community %r not run for %s/%s — skipped',
+                                cm, inttype, source)
+                    continue
+                p = write_pymol_communities(
+                    G                = G,
+                    pdb_path         = ref_pdb,
+                    outpath          = comm_dir,
+                    community_df     = cdf_comm,
+                    community_method = cm,
+                    resindex_to_pdb  = self.resindex_to_pdb,
+                    sphere_scale     = sphere_scale,
+                    stick_scale      = stick_scale,
+                    filename         = f'{source}_{cm}.pml',
+                )
+                out_files.append(p)
+                log.info('PyMOL community: %s/%s', inttype, p.name)
         return out_files
 
     # ═════════════════════════════════════════════════════════════════════════
@@ -498,8 +592,10 @@ class Network:
         energy_use_abs : bool
             Per-row weight: ``|energy_total|`` if True, else ``max(0, -energy_total)``.
         min_energy : float
-            Drop edges (per window) whose total summed weight is at or below this
-            (kJ/mol, post-transform). Windowed graphs are always energy-sourced.
+            Drop edges (per window) with weight ≤ this (percent of the strongest
+            edge across all windows, 0..100). Energy strengths are normalised to
+            0..100 using a global max so the threshold is comparable between
+            windows. Windowed graphs are always energy-sourced.
         frame_start, frame_stop : int, optional
             Restrict the per-frame data to ``[frame_start, frame_stop)``. Either
             or both may be None — None means "no bound on that side". When both
@@ -547,6 +643,17 @@ class Network:
             )
             log.info('  %s: %d frames → %d (window,pair) rows',
                      inttype, df['frame'].nunique(), len(wdf))
+
+            # normalise to 0..100 "% of strongest edge" using a GLOBAL max across
+            # all windows, so min_energy means the same % in every window and the
+            # windows stay comparable for community-evolution tracking.
+            wmax = wdf['weight'].max() if len(wdf) else 0.0
+            if wmax > 0:
+                wdf = wdf.copy()
+                wdf['weight'] = 100.0 * wdf['weight'] / wmax
+            else:
+                wdf = wdf.copy()
+                wdf['weight'] = 0.0
 
             for window_start, gdf in wdf.groupby('window_start'):
                 pairs = gdf[['res_1', 'res_2', 'weight']]
@@ -616,7 +723,9 @@ class Network:
                 if not rows:
                     continue
                 out_df = pd.DataFrame(rows)
-                out_path = self.out / f'community_evolution_{inttype}_{source}_{method}.csv'
+                ev_dir = self.out / inttype / 'time_resolved'
+                makedirs(ev_dir, exist_ok=True)
+                out_path = ev_dir / f'community_evolution_{source}_{method}.csv'
                 out_df.to_csv(out_path, index=False)
                 written[(inttype, source, method)] = out_path
                 log.info('community evolution: %s (%d (window,residue) rows)',
@@ -661,8 +770,10 @@ class Network:
                 for n in H.nodes():
                     H.nodes[n]['community'] = int(comm_map.get(int(n), -1))
 
+            gml_dir = self.out / inttype
+            makedirs(gml_dir, exist_ok=True)
             out_path = write_graphml(
-                H, self.out, filename=f'network_{inttype}_{source}.graphml',
+                H, gml_dir, filename=f'network_{source}.graphml',
             )
             out_paths.append(out_path)
             log.info('GraphML: %s', out_path)
@@ -687,10 +798,12 @@ class Network:
         if key not in self.graphs:
             raise KeyError(f'no static graph for {key!r}. Available: {list(self.graphs)}')
         df = _sp(self.graphs[key], source=source, target=target)
+        inttype, src = key
+        csv_dir = self.out / inttype / 'csv'
+        makedirs(csv_dir, exist_ok=True)
         if filename is None:
-            inttype, src = key
-            filename = f'shortest_paths_{inttype}_{src}.csv'
-        out = self.out / filename
+            filename = f'shortest_paths_{src}.csv'
+        out = csv_dir / filename
         df.to_csv(out, header=True, index=False)
         log.info('shortest_paths: %d pairs → %s', len(df), out)
         return df

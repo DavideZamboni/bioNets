@@ -216,7 +216,7 @@ class Contacts:
                 continue
 
             log.info(f"Processing interaction type: {inttype}")
-            myout = Path(self.outp / inttype.split("_")[0])
+            myout = Path(self.outp / inttype)
             makedirs(myout, exist_ok=True)
             
             seles = self.build_selections(inttype)

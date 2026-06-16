@@ -185,8 +185,8 @@ class NetworkConfig(BaseModel):
         description="Trajectory frames analysed during Contacts. Optional; logged only.",
     )
     # ── Which contact tables to consume ──
-    interactors_type: List[Literal["q", "named"]] = Field(
-        default_factory=lambda: ["q", "named"],
+    interactors_type: List[Literal["q_interactors", "named_interactors"]] = Field(
+        default_factory=lambda: ["q_interactors", "named_interactors"],
         description="Adjacency/ sub-folders to scan.",
     )
     targets: List[Literal["HBonds", "Salt_bridges", "HCs"]] = Field(
@@ -243,17 +243,18 @@ class NetworkConfig(BaseModel):
         description="Seed for stochastic community algorithms.",
     )
     # ── Filtering ──
-    # Edge thresholds are per-source: persistency graphs use min_persistency
-    # (0..100 %), energy graphs use min_energy (the transformed weight, i.e.
-    # max(0,-E) or |E| in kJ/mol). An edge is kept when its summed weight is
-    # strictly greater than the threshold for its source.
+    # Edge thresholds are per-source and both expressed as a percentage on the
+    # 0..100 scale the elbow / degree-distribution plots are scanned on:
+    #   persistency % = 100 · contact-frequency
+    #   energy %      = 100 · strength / max(strength)  (strength = max(0,-E) or |E|)
+    # An edge is kept when its weight (in %) is strictly greater than the threshold.
     min_persistency: float = Field(
         default=0.0, ge=0.0, le=100.0,
-        description="Drop persistency edges with summed weight ≤ this (percent, 0..100).",
+        description="Drop persistency edges with weight ≤ this (percent, 0..100).",
     )
     min_energy: float = Field(
-        default=0.0, ge=0.0,
-        description="Drop energy edges with summed weight ≤ this (kJ/mol, post-transform).",
+        default=0.0, ge=0.0, le=100.0,
+        description="Drop energy edges with weight ≤ this (percent of strongest edge, 0..100).",
     )
     min_degree: int = Field(
         default=0, ge=0,

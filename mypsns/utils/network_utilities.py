@@ -79,13 +79,23 @@ mclear
 def build_resindex_to_pdb_map(topology_pdb) -> dict:
     """
     Re-read the topology with MDAnalysis and return
-    ``{Resindex (int): (chain_id (str), pdb_resid (int))}``.
- 
+    ``{Resindex (int): (chain_id (str), pdb_resid (int), anchor (str | None))}``.
+
     PyMOL selects residues by ``chain X and resi N`` where ``N`` is the PDB
     residue number — *not* MDAnalysis' global ``Resindex``.  The map lets the
     PyMOL writer emit correct selectors regardless of multi-chain offsets,
     insertion codes, or non-contiguous numbering.
- 
+
+    ``anchor`` is the atom name to render the residue's node / edge endpoint on,
+    chosen so that non-protein residues (ions, lipids, nucleic acids, sugars)
+    also display:
+
+      * ``'CA'``           if the residue has a CA atom (standard amino acids);
+      * the lone atom name  if the residue is monoatomic (e.g. a CAL/NA/CL ion);
+      * ``None``            otherwise (multi-atom residue with no CA — lipids,
+                            nucleotides, carbohydrates). The writer then renders
+                            a pseudoatom at the residue's center of mass.
+
     Falls back to an empty dict if MDAnalysis can't open the file.
     """
     import logging
@@ -105,6 +115,7 @@ def build_resindex_to_pdb_map(topology_pdb) -> dict:
         return {}
  
     out: dict = {}
+    n_ca = n_single = n_com = 0
     for res in u.residues:
         # chainID is the PDB chain; fall back to segid (GROMACS-style)
         chain = ''
@@ -122,10 +133,27 @@ def build_resindex_to_pdb_map(topology_pdb) -> dict:
             resnum = int(res.resnum)
         except Exception:
             continue
-        out[int(res.resindex)] = (chain, resnum)
+
+        # ── anchor-atom selection ────────────────────────────────────────────
+        try:
+            names = [str(n) for n in res.atoms.names]
+        except Exception:
+            names = []
+        if 'CA' in names:
+            anchor = 'CA'
+            n_ca += 1
+        elif len(names) == 1:
+            anchor = names[0]          # monoatomic ion
+            n_single += 1
+        else:
+            anchor = None              # multi-atom, no CA → center of mass
+            n_com += 1
+
+        out[int(res.resindex)] = (chain, resnum, anchor)
  
-    logging.info('build_resindex_to_pdb_map: %d residues mapped from %s',
-                 len(out), topology_pdb)
+    logging.info('build_resindex_to_pdb_map: %d residues mapped from %s '
+                 '(%d CA, %d single-atom, %d center-of-mass)',
+                 len(out), topology_pdb, n_ca, n_single, n_com)
     return out
 
 def find_merged_csvs(
@@ -875,123 +903,236 @@ def write_graphml(
     logging.info(f'write_graphml: graph written to {out}')
     return out
 
-def write_pymol_session(
-    G:                nx.Graph,
-    pdb_path:         Union[str, Path],
-    outpath:          Path,
-    node_metric:      str,
-    centrality_df:    pd.DataFrame,
-    community_df:     pd.DataFrame,
-    community_method: str,
-    resindex_to_pdb:  Optional[Dict[int, Tuple[str, int]]] = None,
-    sphere_scale:     float = 2.0,
-    stick_scale:      float = 0.5,
-    filename:         str   = 'network.pml',
+_PYMOL_EDGE_COLOR: str = 'gray60'   # all network edges (connectivity)
+
+
+def _residue_selector(chain: str, resnum: int) -> str:
+    """Base PyMOL residue selector (no atom-name restriction)."""
+    return f'chain {chain} and resi {resnum}' if chain else f'resi {resnum}'
+
+
+def _point_name(resix: int) -> str:
+    """Name of the per-residue pseudoatom both nodes and edges reference."""
+    return f'pt_{resix}'
+
+
+def _pml_make_points(
+    G:               nx.Graph,
+    resindex_to_pdb: Dict[int, Tuple[str, int, Optional[str]]],
+) -> Tuple[List[str], set]:
+    """
+    For every graph node, emit a PyMOL ``pseudoatom`` placed at the residue's
+    anchor so that nodes/edges render uniformly across residue types:
+
+      * anchor atom (CA, or the lone atom of a monoatomic ion) → pseudoatom at
+        that atom's position;
+      * no anchor (multi-atom residue without CA: lipid / nucleotide / sugar) →
+        pseudoatom at the residue's center of mass (``selection=... `` makes
+        PyMOL place it at the selection centroid).
+
+    Residues missing from the map are skipped (cannot be addressed). Returns
+    (lines, set_of_placed_resindices).
+    """
+    lines: List[str] = ['# ── per-residue anchor points (CA / ion / center of mass) ──']
+    placed: set = set()
+    for resix in G.nodes():
+        hit = resindex_to_pdb.get(int(resix))
+        if hit is None:
+            continue
+        chain, resnum, anchor = hit
+        base = _residue_selector(chain, resnum)
+        pt = _point_name(resix)
+        if anchor is not None:
+            sel = f'({base}) and name {anchor}'
+        else:
+            sel = f'({base})'              # whole residue → centroid
+        # pseudoatom at the selection centroid (single atom → its position)
+        lines.append(f'pseudoatom {pt}, selection=({sel})')
+        placed.add(int(resix))
+    lines.append('')
+    return lines, placed
+
+
+def _pml_structure_header(pdb_path: Union[str, Path]) -> List[str]:
+    """Preamble + load the reference structure as a translucent cartoon."""
+    return [
+        _PYMOL_PREAMBLE,
+        f'load {Path(pdb_path).resolve()}, structure',
+        'hide everything, structure',
+        'show cartoon, structure',
+        'set cartoon_transparency, 0.6, structure',
+        'color grey80, structure',
+        '',
+    ]
+
+
+def _pml_edges(
+    G:               nx.Graph,
+    placed:          set,
+    stick_scale:     float,
+    colour:          str = _PYMOL_EDGE_COLOR,
+) -> Tuple[List[str], int]:
+    """Gray network edges as solid cylinders between per-residue pseudoatoms,
+    radius scaled by edge weight. Only edges whose BOTH endpoints have a placed
+    pseudoatom are drawn. Returns (lines, n_edges).
+
+    Notes on PyMOL distance objects:
+      * ``color`` does NOT recolor a distance object — use ``set dash_color``.
+      * dashes render as thin 2D lines unless ``dash_as_cylinders`` is on, so we
+        enable that to get a visible, weight-scaled 3D stick.
+      * ``dash_gap 0`` + ``dash_length`` make the cylinder solid (no gaps).
+    """
+    weights = [d.get('weight', 0.0) for _, _, d in G.edges(data=True)]
+    wmax = max(weights) if weights else 0.0
+    lines: List[str] = ['# ── network edges (gray; connectivity, radius scaled by weight) ──']
+    n_edges = 0
+    for u, v, data in G.edges(data=True):
+        if int(u) not in placed or int(v) not in placed:
+            continue
+        w = float(data.get('weight', 0.0))
+        radius = 0.05 + stick_scale * (w / wmax if wmax > 0 else 0.0)
+        obj = f'edge_{u}_{v}'
+        lines.append(f'distance {obj}, {_point_name(u)}, {_point_name(v)}')
+        lines.append(f'hide labels, {obj}')
+        lines.append(f'set dash_as_cylinders, 1, {obj}')
+        lines.append(f'set dash_gap, 0.0, {obj}')
+        lines.append(f'set dash_length, 1.0, {obj}')
+        lines.append(f'set dash_radius, {radius:.3f}, {obj}')
+        lines.append(f'set dash_color, {colour}, {obj}')
+        n_edges += 1
+    lines.append('')
+    return lines, n_edges
+
+
+def _pml_footer() -> List[str]:
+    return [
+        'group nodes, node_*',
+        'group points, pt_*',
+        'group edges, edge_*',
+        'set dash_round_ends, 1',
+        'orient structure',
+    ]
+
+
+def write_pymol_nodes(
+    G:               nx.Graph,
+    pdb_path:        Union[str, Path],
+    outpath:         Path,
+    node_metric:     str,
+    centrality_df:   pd.DataFrame,
+    resindex_to_pdb: Optional[Dict[int, Tuple[str, int]]] = None,
+    sphere_scale:    float = 2.0,
+    stick_scale:     float = 0.5,
+    node_colour:     str   = 'marine',
+    filename:        str   = 'nodes.pml',
 ) -> Path:
     '''
-    Write a PyMOL ``.pml`` script that renders the residue-interaction network
-    on top of the reference structure.
+    PyMOL script rendering ONE node-centrality metric.
 
-    Nodes
-        One CA sphere per residue, vdw radius scaled linearly by ``node_metric``
-        (a column of ``centrality_df``) up to ``sphere_scale`` Å, coloured by the
-        residue's community (from ``community_df``).
-    Edges
-        One ``distance`` object per graph edge, dash radius scaled by edge weight
-        up to ``stick_scale`` Å. Intra-community edges take the community colour;
-        cross-community edges use ``_PYMOL_CROSS_COLOR``.
-
-    Residue selectors use ``chain X and resi N`` with the PDB residue number from
-    ``resindex_to_pdb``; if a residue is missing from the map, that node/edge is
-    skipped (it cannot be addressed in PyMOL reliably).
-
-    Returns the Path to the written script.
+    One CA sphere per residue, vdw radius scaled linearly by ``node_metric``
+    (a column of ``centrality_df``). The gray network edges are drawn underneath
+    to show connectivity. No community colouring here — see
+    :func:`write_pymol_communities`.
     '''
     outpath = Path(outpath)
     out = outpath / filename
     resindex_to_pdb = resindex_to_pdb or {}
 
-    # ── metric → per-residue sphere radius ───────────────────────────────────
     if node_metric not in centrality_df.columns:
-        logging.warning('write_pymol_session: metric %r absent — spheres flat', node_metric)
+        logging.warning('write_pymol_nodes: metric %r absent — spheres flat', node_metric)
         metric_by_res: Dict[int, float] = {}
     else:
         m = centrality_df.set_index('resindex')[node_metric].astype(float)
         mmax = float(m.max()) if len(m) else 0.0
         metric_by_res = (m / mmax).to_dict() if mmax > 0 else {r: 0.0 for r in m.index}
 
-    # ── community colour per residue ─────────────────────────────────────────
+    lines = _pml_structure_header(pdb_path)
+
+    # per-residue anchor pseudoatoms (CA / ion / center of mass)
+    point_lines, placed = _pml_make_points(G, resindex_to_pdb)
+    lines += point_lines
+
+    lines.append('# ── network nodes (spheres scaled by %s) ──' % node_metric)
+    n_nodes = 0
+    for resix in G.nodes():
+        if int(resix) not in placed:
+            continue
+        radius = 0.3 + sphere_scale * float(metric_by_res.get(int(resix), 0.0))
+        pt = _point_name(resix)
+        obj = f'node_{resix}'
+        lines.append(f'create {obj}, {pt}')
+        lines.append(f'show spheres, {obj}')
+        lines.append(f'set sphere_scale, {radius:.3f}, {obj}')
+        lines.append(f'color {node_colour}, {obj}')
+        n_nodes += 1
+    lines.append('')
+
+    edge_lines, n_edges = _pml_edges(G, placed, stick_scale)
+    lines += edge_lines
+    lines += _pml_footer()
+
+    out.write_text('\n'.join(lines) + '\n')
+    logging.info('write_pymol_nodes: %s (%d nodes, %d edges, metric=%s)',
+                 out.name, n_nodes, n_edges, node_metric)
+    return out
+
+
+def write_pymol_communities(
+    G:                nx.Graph,
+    pdb_path:         Union[str, Path],
+    outpath:          Path,
+    community_df:     pd.DataFrame,
+    community_method: str,
+    resindex_to_pdb:  Optional[Dict[int, Tuple[str, int]]] = None,
+    sphere_scale:     float = 2.0,
+    stick_scale:      float = 0.5,
+    filename:         str   = 'community.pml',
+) -> Path:
+    '''
+    PyMOL script rendering ONE community partition.
+
+    One CA sphere per residue (uniform size), coloured by the residue's
+    community from ``community_df``. The gray network edges are drawn underneath
+    to show connectivity. No centrality scaling here — see
+    :func:`write_pymol_nodes`.
+    '''
+    outpath = Path(outpath)
+    out = outpath / filename
+    resindex_to_pdb = resindex_to_pdb or {}
+
     comm_by_res = dict(zip(community_df['resindex'].astype(int),
                            community_df['community'].astype(int)))
 
     def _colour(community_id: int) -> str:
         return _PYMOL_PALETTE[community_id % len(_PYMOL_PALETTE)]
 
-    def _sel(resix: int) -> Optional[str]:
-        hit = resindex_to_pdb.get(int(resix))
-        if hit is None:
-            return None
-        chain, resnum = hit
-        if chain:
-            return f'chain {chain} and resi {resnum}'
-        return f'resi {resnum}'
+    lines = _pml_structure_header(pdb_path)
 
-    # ── edge weight normalisation ────────────────────────────────────────────
-    weights = [d.get('weight', 0.0) for _, _, d in G.edges(data=True)]
-    wmax = max(weights) if weights else 0.0
+    # per-residue anchor pseudoatoms (CA / ion / center of mass)
+    point_lines, placed = _pml_make_points(G, resindex_to_pdb)
+    lines += point_lines
 
-    lines: List[str] = [_PYMOL_PREAMBLE]
-    lines.append(f'load {Path(pdb_path).resolve()}, structure')
-    lines.append('hide everything, structure')
-    lines.append('show cartoon, structure')
-    lines.append('set cartoon_transparency, 0.6, structure')
-    lines.append('color grey80, structure')
-    lines.append('')
-
-    # ── nodes ────────────────────────────────────────────────────────────────
-    lines.append('# ── network nodes (CA spheres scaled by %s) ──' % node_metric)
+    lines.append('# ── network communities (spheres coloured by %s) ──' % community_method)
+    base_radius = 0.3 + 0.5 * sphere_scale     # uniform, mid-sized
     n_nodes = 0
-    for resix, data in G.nodes(data=True):
-        sel = _sel(resix)
-        if sel is None:
+    for resix in G.nodes():
+        if int(resix) not in placed:
             continue
-        comm = comm_by_res.get(int(resix), 0)
-        colour = _colour(comm)
-        radius = 0.3 + sphere_scale * float(metric_by_res.get(int(resix), 0.0))
+        colour = _colour(comm_by_res.get(int(resix), 0))
+        pt = _point_name(resix)
         obj = f'node_{resix}'
-        lines.append(f'create {obj}, ({sel}) and name CA')
+        lines.append(f'create {obj}, {pt}')
         lines.append(f'show spheres, {obj}')
-        lines.append(f'set sphere_scale, {radius:.3f}, {obj}')
+        lines.append(f'set sphere_scale, {base_radius:.3f}, {obj}')
         lines.append(f'color {colour}, {obj}')
         n_nodes += 1
     lines.append('')
 
-    # ── edges ────────────────────────────────────────────────────────────────
-    lines.append('# ── network edges (distance objects scaled by weight) ──')
-    n_edges = 0
-    for u, v, data in G.edges(data=True):
-        s1, s2 = _sel(u), _sel(v)
-        if s1 is None or s2 is None:
-            continue
-        cu = comm_by_res.get(int(u), 0)
-        cv = comm_by_res.get(int(v), 0)
-        colour = _colour(cu) if cu == cv else _PYMOL_CROSS_COLOR
-        w = float(data.get('weight', 0.0))
-        radius = 0.02 + stick_scale * (w / wmax if wmax > 0 else 0.0)
-        obj = f'edge_{u}_{v}'
-        lines.append(f'distance {obj}, ({s1}) and name CA, ({s2}) and name CA')
-        lines.append(f'hide labels, {obj}')
-        lines.append(f'set dash_radius, {radius:.3f}, {obj}')
-        lines.append(f'set dash_gap, 0, {obj}')
-        lines.append(f'color {colour}, {obj}')
-        n_edges += 1
-    lines.append('')
-    lines.append('group nodes, node_*')
-    lines.append('group edges, edge_*')
-    lines.append('set dash_round_ends, 1')
-    lines.append('orient structure')
+    edge_lines, n_edges = _pml_edges(G, placed, stick_scale)
+    lines += edge_lines
+    lines += _pml_footer()
 
     out.write_text('\n'.join(lines) + '\n')
-    logging.info('write_pymol_session: %s (%d nodes, %d edges, community=%s)',
+    logging.info('write_pymol_communities: %s (%d nodes, %d edges, community=%s)',
                  out.name, n_nodes, n_edges, community_method)
     return out

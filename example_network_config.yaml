@@ -42,24 +42,18 @@ network:
   # ── Node / community analysis ─────────────────────────────────────────────
   node_metrics:                    # one .pml per metric × community × source
     - betweenness_centrality
-    - degree 
-    - weighted_degree
-    - degree_centrality
-    - closeness_centrality
-    #  choices: betweenness_centrality | degree | weighted_degree | degree_centrality | closeness_centrality
+    # other choices: degree | weighted_degree | degree_centrality | closeness_centrality
   community_methods:
     - louvain
-    - greedy_modularity 
-    - label_propagation
-    - connected_components
-    # choices: louvain | greedy_modularity | label_propagation | connected_components
+    # other choices: greedy_modularity | label_propagation | connected_components
   community_seed: 42               # seed for stochastic community algorithms
 
   # ── Filtering ─────────────────────────────────────────────────────────────
-  # Thresholds are per-source. An edge is kept when its summed weight is
-  # strictly greater than the threshold for its source.
-  min_persistency: 0.0             # persistency graphs: percent, 0..100
-  min_energy: 0.0                  # energy graphs: kJ/mol (post-transform weight)
+  # Both thresholds are percentages on the 0..100 scale the elbow / degree
+  # plots are scanned on. An edge is kept when its weight (%) is strictly
+  # greater than the threshold for its source.
+  min_persistency: 0.0             # persistency graphs: percent contact frequency, 0..100
+  min_energy: 0.0                  # energy graphs: percent of the strongest edge, 0..100
   min_degree: 0                    # drop nodes below this degree
 
   # ── PyMOL rendering ───────────────────────────────────────────────────────

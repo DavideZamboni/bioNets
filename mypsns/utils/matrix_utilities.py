@@ -230,6 +230,26 @@ def energy_transform(
     Matches the convention in get_persistence_analysis / energy_to_percentage.
     """
     return np.abs(mat) if use_abs else np.maximum(0.0, -mat)
+
+
+def strength_to_percentage(mat: np.ndarray) -> np.ndarray:
+    """
+    Map a non-negative strength matrix onto 0..100 "% of the strongest edge".
+
+        pct[i,j] = 100 * mat[i,j] / max(off-diagonal mat)
+
+    The diagonal is zeroed. If every off-diagonal entry is 0, returns zeros.
+    Matches the normalisation in contacts_utilities.energy_to_percentage, so a
+    percentage threshold here means the same thing the energy elbow/degree
+    plots are scanning.
+    """
+    m = np.array(mat, dtype=float, copy=True)
+    np.fill_diagonal(m, 0.0)
+    iu = np.triu_indices_from(m, k=1)
+    smax = m[iu].max() if m[iu].size else 0.0
+    if smax <= 0:
+        return np.zeros_like(m)
+    return 100.0 * m / smax
  
  
 def load_per_type_matrix(

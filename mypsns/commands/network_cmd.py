@@ -122,7 +122,7 @@ def network(
     ),
     min_energy: Optional[float] = typer.Option(
         None, "--min-energy",
-        help="Drop energy edges with summed weight \u2264 this (kJ/mol, post-transform).",
+        help="Drop energy edges with weight \u2264 this (percent of strongest edge, 0..100).",
         rich_help_panel=PANEL_FILTER,
     ),
     min_degree: Optional[int] = typer.Option(
