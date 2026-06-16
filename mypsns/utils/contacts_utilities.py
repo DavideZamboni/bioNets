@@ -281,61 +281,101 @@ def init_defaults(poly_chains: List[str], found_chains: List[str], log_queue: mp
 # SELECTION – get_selection, generate_combinations
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def _ids_to_sel(sub_df: pd.DataFrame, chainID: str) -> Tuple[Optional[str], int]:
+    """Build a compact, readable selection grouped by (resname, atom-name set):
+        (chainID X) and (
+            (resname A and resid R1 R2 ... and name N1 N2)
+            or (resname B and resid R3 R4 ... and name M1 M2)
+            ...
+        )
+    Residues sharing both their resname and the exact set of tagged atom
+    names collapse into a single clause. Assumes atom names are unique
+    within a residue (standard protein/lipid topologies).
+
+    Returns (selection_string, expected_atom_count). The string is None and
+    the count is 0 when there are no atoms to select.
+    """
+    if 'atom_name' not in sub_df.columns or 'Resindex' not in sub_df.columns:
+        return None, 0
+    sub_df = sub_df.dropna(subset=['atom_name', 'Resindex'])
+    if sub_df.empty:
+        return None, 0
+    has_resname = 'resname' in sub_df.columns
+
+    # Group residues by (resname, frozenset of atom names)
+    groups: Dict[Tuple[str, frozenset], List[int]] = {}
+    for resindex, gdf in sub_df.groupby('Resindex'):
+        names = frozenset(gdf['atom_name'].astype(str).unique())
+        if not names:
+            continue
+        rn = ''
+        if has_resname:
+            rn_series = gdf['resname'].dropna().astype(str)
+            if not rn_series.empty:
+                rn = rn_series.iloc[0]
+        groups.setdefault((rn, names), []).append(int(resindex))
+
+    clauses: List[str] = []
+    for (rn, names), resids in groups.items():
+        names_str  = ' '.join(sorted(names))
+        resids_str = ' '.join(str(r) for r in sorted(resids))
+        if rn:
+            clauses.append(
+                f'(resname {rn} and resid {resids_str} and name {names_str})'
+            )
+        else:
+            clauses.append(f'(resid {resids_str} and name {names_str})')
+
+    if not clauses:
+        return None, 0
+    return f'(chainID {chainID}) and ({" or ".join(clauses)})', len(sub_df)
+
 def get_selection(
     chain_df: pd.DataFrame,
     inttype:  str,
     role:     str,
     chainID:  str,
-) -> Optional[Union[str, Dict[str, str]]]:
+) -> Optional[Union[Tuple[str, int], Dict[str, Tuple[str, int]]]]:
     """
     Build MDAnalysis selection string(s) for atoms matching a role.
 
-    For HC role with q_interactors: returns a dict keyed by HC_cluster label.
-    For all other cases: returns a single selection string.
-
-    Uses column 'atom_index' for atom IDs in the selection string.
+    HC role → {cluster_label: (sel_str, expected_count)}
+    Other roles → (sel_str, expected_count)
+    Returns None when no atoms match (so build_selections' `if sel is not None`
+    drops the role cleanly and the wrappers' .get(role, (None, 0)) default
+    kicks in).
     """
     if inttype not in chain_df.columns:
         return None
 
     mask = chain_df[inttype].astype(str).str.contains(role, na=False)
     matched = chain_df[mask]
-
     if matched.empty:
         return None
 
-    def _ids_to_sel(sub_df: pd.DataFrame) -> Optional[str]:
-        if 'atom_index' not in sub_df.columns:
-            return None
-        # MDAnalysis 0-based .index == atom_index - 1 (intrinsic, overflow-proof)
-        indices = (sub_df['atom_index'].dropna().astype(int) - 1).tolist()
-        if not indices:
-            return None
-        idx_str = ' '.join(str(i) for i in indices)
-        return f'(chainID {chainID}) and (index {idx_str})'
-
-    # HC with q_interactors → per-cluster, per-resid selections
+    # HC q_interactors → per-cluster, per-resid selections
     if role == 'HC' and inttype == 'q_interactors' and 'HC_cluster' in matched.columns:
-        cluster_seles = {}
+        cluster_seles: Dict[str, Tuple[str, int]] = {}
         for ri, resdf in matched.groupby(by='Resindex'):
             for clust_label, clust_df in resdf.groupby('HC_cluster'):
                 if pd.isna(clust_label):
                     continue
-                sel = _ids_to_sel(clust_df)
-                if sel is not None:
-                    cluster_seles[str(clust_label) + f'_{ri}'] = sel
-        return cluster_seles if cluster_seles else None
-    
-    elif role == 'HC' and inttype == 'named_interactors':
+                sel_str, expected = _ids_to_sel(clust_df, chainID=chainID)
+                if sel_str is not None:
+                    cluster_seles[f'{clust_label}_{ri}'] = (sel_str, expected)
+        return cluster_seles or None
+
+    if role == 'HC' and inttype == 'named_interactors':
         cluster_seles = {}
         for ri, resdf in matched.groupby(by='Resindex'):
-            sel = _ids_to_sel(resdf)
-            if sel is not None:
-                cluster_seles['HC' + f'_{ri}'] = sel
-        return cluster_seles if cluster_seles else None
+            sel_str, expected = _ids_to_sel(resdf, chainID=chainID)
+            if sel_str is not None:
+                cluster_seles[f'HC_{ri}'] = (sel_str, expected)
+        return cluster_seles or None
 
-    # Everything else → single selection
-    return _ids_to_sel(matched)
+    # Single selection
+    sel_str, expected = _ids_to_sel(matched, chainID=chainID)
+    return (sel_str, expected) if sel_str is not None else None
 
 def generate_combinations(
     subjects: List[str],
@@ -359,12 +399,16 @@ def generate_combinations(
 # CORE – selection checker, distance evaluators, position getters, RAM guard
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def check_selection(u: mda.Universe, selection: str) -> bool:
-    num_ats  = len(u.select_atoms(selection))
-    num_ids = len([i for i in selection.split(' and (index')[1].split(' ') if i != ''])
-    if (num_ats != num_ids):
-        log.warning(f'Atoms expected (# ids in selection): {num_ids}\tActually found (Atoms in Universe selction): {num_ats}')
-        log.warning('expected and found number of atoms in the universe do not match')
+def check_selection(u: mda.Universe, selection: str,
+                    expected: Optional[int] = None) -> bool:
+    """Verify a selection returns atoms (optionally a specific count)."""
+    n = len(u.select_atoms(selection))
+    if n == 0:
+        log.warning('Selection matched 0 atoms: %s', selection[:200])
+        return False
+    if expected is not None and n != expected:
+        log.warning('Selection matched %d atoms, expected %d: %s',
+                    n, expected, selection[:200])
         return False
     return True
 
@@ -714,11 +758,12 @@ def core_hc(
  
     # ── Frame loop ───────────────────────────────────────────────────────────
     hc_dict: dict = {'frame': [], 'id_1': [], 'id_2': [], 'distance': []}
- 
+    last_frame = frames[0]
+
     for frame in frames:
         if check_ram_usage(threshold):
             pd.DataFrame(hc_dict).to_csv(
-                outpath / f'{outname}_upto_{frame}.csv', header=True, index=False
+                outpath / f'{outname}_upto_{last_frame}.csv', header=True, index=False
             )
             hc_dict = {'frame': [], 'id_1': [], 'id_2': [], 'distance': []}
  
@@ -752,9 +797,10 @@ def core_hc(
                     hc_dict, frame, np.array(pos1), cutoff, dims, names1,
                     np.array(pos2), names2
                 )
- 
+        last_frame = frame
+
     pd.DataFrame(hc_dict).to_csv(
-        outpath / f'{outname}_upto_{frames[-1]}.csv', header=True, index=False
+        outpath / f'{outname}_upto_{last_frame}.csv', header=True, index=False
     )
     log.info(f'HC worker done: frames {frames[0]}–{frames[-1]}')
     return 'HC', frames[0], frames[-1]
@@ -802,19 +848,19 @@ def salt_bridges(
     log.info(f'salt_bridges: cutoff={cutoff} Å\n')
 
     for cs in combos:
-        c1        = cs[0]
-        sel_1_ac  = selections.get(c1, {}).get('Acidic')
-        sel_1_bas = selections.get(c1, {}).get('Basic')
+        c1 = cs[0]
+        sel_1_ac, ac1_expected = selections.get(c1, {}).get('Acidic', (None, 0))
+        sel_1_bas, bas1_expected = selections.get(c1, {}).get('Basic', (None, 0))
 
         if sel_1_ac is None or sel_1_bas is None:
             log.info(f'  Chain {c1}: empty Acidic or Basic selection – intrachain skipped.\n')
         else:
             u = mda.Universe(top, trj)
-            keep_running = check_selection(u, sel_1_ac)
+            keep_running = check_selection(u, sel_1_ac, expected = ac1_expected)
             if not keep_running:
                 break
 
-            keep_running = check_selection(u, sel_1_bas)
+            keep_running = check_selection(u, sel_1_bas, expected = bas1_expected)
             if not keep_running:
                 break
 
@@ -833,12 +879,12 @@ def salt_bridges(
             log.info(f'  Chain {c1} intrachain SB: {timeit.default_timer()-t0:.2f}s\n')
 
         for c2 in cs[1:]:
-            sel_2_ac  = selections.get(c2, {}).get('Acidic')
-            sel_2_bas = selections.get(c2, {}).get('Basic')
+            sel_2_ac, ac2_expected  = selections.get(c2, {}).get('Acidic', (None, 0))
+            sel_2_bas, bas2_expected = selections.get(c2, {}).get('Basic', (None, 0))
             t0 = timeit.default_timer()
 
             if sel_1_bas is not None and sel_2_ac is not None:
-                keep_running = check_selection(u, sel_2_ac)
+                keep_running = check_selection(u, sel_2_ac, expected = ac2_expected)
                 if not keep_running:
                     break
 
@@ -857,7 +903,7 @@ def salt_bridges(
                 log.info(f'  Chains {c1}/{c2}: empty selection – {c1}bas×{c2}ac skipped.\n')
 
             if sel_1_ac is not None and sel_2_bas is not None:
-                keep_running = check_selection(u, sel_2_bas)
+                keep_running = check_selection(u, sel_2_bas,expected = bas2_expected)
                 if not keep_running:
                     break
                 
@@ -883,7 +929,7 @@ def salt_bridges(
 def Hbonds(
     top:        str,
     trj:        str,
-    selections: Dict[str, Dict[str, str]],
+    selections: Dict[str, Dict[str, Tuple[str, int]]],
     outpath:    Path,
     frames:     List[List[int]],
     **kwargs,
@@ -914,12 +960,15 @@ def Hbonds(
     u_probe = mda.Universe(top, trj)
     best = None     # (n_atoms, donors, acceptors, hydrogens, chain)
     for ch, roles in selections.items():
-        d, a = roles.get('HDon'), roles.get('HAcc')
+        d, _ = roles.get('HDon',  (None, 0))
+        a, _ = roles.get('HAcc',  (None, 0))
         if not (d and a):
             continue
+        h, _ = roles.get('HBond', (None, 0))    # may be None — fine, HBA accepts that
         n_at = len(u_probe.select_atoms(d)) + len(u_probe.select_atoms(a))
         if best is None or n_at > best[0]:
-            best = (n_at, d, a, roles.get('HBond'), ch)
+            best = (n_at, d, a, h, ch)
+
     if best is not None:
         _, d, a, h, ch = best
         per_worker_window = estimate_hb_frame_window(
@@ -930,9 +979,9 @@ def Hbonds(
     
     for cs in combos:
         c1         = cs[0]
-        sel_1_hacc = selections.get(c1, {}).get('HAcc')
-        sel_1_hdon = selections.get(c1, {}).get('HDon')
-        sel_1_hs   = selections.get(c1, {}).get('HBond')
+        sel_1_hacc, hacc1_expected = selections.get(c1, {}).get('HAcc', (None, 0))
+        sel_1_hdon, hdon1_expected = selections.get(c1, {}).get('HDon', (None, 0))
+        sel_1_hs, hs1_expected   = selections.get(c1, {}).get('HBond', (None, 0))
 
         log.info(f'Chain {c1}:\n\tAcceptors: {sel_1_hacc}\n\tDonors: {sel_1_hdon}')
 
@@ -941,14 +990,14 @@ def Hbonds(
             log.info(f'  Chain {c1}: empty HAcc or HDon – intrachain skipped.\n')
         else:
             u = mda.Universe(top, trj)
-            keep_running = check_selection(u, sel_1_hacc)
+            keep_running = check_selection(u, sel_1_hacc, expected = hacc1_expected)
             if not keep_running:
                 break
-            keep_running = check_selection(u, sel_1_hdon)
+            keep_running = check_selection(u, sel_1_hdon, expected = hdon1_expected)
             if not keep_running:
                 break
-            if (sel_1_hs != None):
-                keep_running = check_selection(u, sel_1_hs)
+            if (sel_1_hs is not None):
+                keep_running = check_selection(u, sel_1_hs, expected = hs1_expected)
                 if not keep_running:
                     break
 
@@ -970,20 +1019,20 @@ def Hbonds(
             log.info(f'  Chain {c1} intrachain HB: {timeit.default_timer()-t0:.2f}s\n')
 
         for c2 in cs[1:]:
-            sel_2_hacc = selections.get(c2, {}).get('HAcc')
-            sel_2_hdon = selections.get(c2, {}).get('HDon')
-            sel_2_hs   = selections.get(c2, {}).get('HBond')
+            sel_2_hacc, hacc2_expected = selections.get(c2, {}).get('HAcc', (None, 0))
+            sel_2_hdon, hdon2_expected = selections.get(c2, {}).get('HDon', (None, 0))
+            sel_2_hs, hs2_expected   = selections.get(c2, {}).get('HBond', (None, 0))
             t0 = timeit.default_timer()
 
             if sel_1_hdon is not None and sel_2_hacc is not None:
-                keep_running = check_selection(u, sel_2_hacc)
+                keep_running = check_selection(u, sel_2_hacc, expected = hacc2_expected)
                 if not keep_running:
                     break
 
                 fname   = f'{c1}_HDon_{c2}_HAcc'
                 outnames.append(fname)
                 allargs = [
-                    (top, trj, mf, sel_1_hacc, sel_1_hdon, distc, angc,
+                    (top, trj, mf, sel_2_hacc, sel_1_hdon, distc, angc,
                      outpath, fname, sel_1_hs, per_worker_window, 'hb')
                     for mf in frames
                 ]
@@ -996,11 +1045,11 @@ def Hbonds(
                 log.info(f'  Chains {c1}/{c2}: empty selection – {c1}Don×{c2}Acc skipped.\n')
 
             if sel_1_hacc is not None and sel_2_hdon is not None:
-                keep_running = check_selection(u, sel_2_hdon)
+                keep_running = check_selection(u, sel_2_hdon, expected = hdon2_expected)
                 if not keep_running:
                     break
-                if (sel_2_hs != None):
-                    keep_running = check_selection(u, sel_2_hs)
+                if (sel_2_hs is not None):
+                    keep_running = check_selection(u, sel_2_hs, expected = hs2_expected)
                     if not keep_running:
                         break
 
@@ -1008,8 +1057,8 @@ def Hbonds(
                 outnames.append(fname)
                 
                 allargs = [
-                    (top, trj, mf, sel_1_hacc, sel_1_hdon, distc, angc,
-                     outpath, fname, sel_1_hs, per_worker_window, 'hb')
+                    (top, trj, mf, sel_1_hacc, sel_2_hdon, distc, angc,
+                     outpath, fname, sel_2_hs, per_worker_window, 'hb')
                     for mf in frames
                 ]
                 pool = mp.Pool(processes=nc, initializer=worker_init, initargs=(log_queue,))
@@ -1060,40 +1109,39 @@ def hydrophobics(
 
     for cs in combos:
         c1 = cs[0]
-        sel_1_hc = selections.get(c1, {}).get('HC')
-        log.info(f'Chain {c1}:\n\tHCs: {sel_1_hc}')
+        sel_1_hc = selections.get(c1, {}).get('HC', {})        # dict default
+        log.info(f'Chain {c1}:\n\tHCs: {list(sel_1_hc)}')
 
-        if sel_1_hc is None:
-            log.info('skipped')
+        if not sel_1_hc:
             log.info(f'  Chain {c1}: no HC selection – skipped.\n')
             continue
-        
 
-        # sel_1_hc must be a dict  {label: selection_string}
-        if not isinstance(sel_1_hc, dict):
-            log.warning(f'Chain {c1}: HC selection is str, expected dict – skipped.')
-            continue
- 
-        # ── Log what we got ──────────────────────────────────────────────────
         u = mda.Universe(top, trj)
-        n_atoms_total = 0
-        for label, sel_str in sel_1_hc.items():
-            grp = u.select_atoms(sel_str)
-            keep_running = check_selection(u, sel_str)
-            if not keep_running:
-                break
 
-            n_atoms_total += len(grp)
-        log.info(f'Chain {c1}: {len(sel_1_hc)} HC groups, {n_atoms_total} atoms total')
- 
-        # ── Intrachain ───────────────────────────────────────────────────────
+        # Validate each cluster, build a string-only dict for core_hc
+        sel_1_hc_str: Dict[str, str] = {}
+        n_atoms_total = 0
+        keep_running  = True
+        for label, (sel_str, expected) in sel_1_hc.items():
+            if sel_str is None:
+                continue
+            if not check_selection(u, sel_str, expected=expected):
+                keep_running = False
+                break
+            sel_1_hc_str[label] = sel_str
+            n_atoms_total += expected
+        if not keep_running:
+            break
+        log.info(f'Chain {c1}: {len(sel_1_hc_str)} HC groups, {n_atoms_total} atoms total')
+
+        # Intrachain — pass the string-only dict
         fname = f'{c1}_intrachain_HC'
         outnames.append(fname)
         allargs = [
-            (top, trj, mf, sel_1_hc, cutoff, outpath, fname,
-             ram_thr, None, 'hc')
+            (top, trj, mf, sel_1_hc_str, cutoff, outpath, fname, ram_thr, None, 'hc')
             for mf in frames
         ]
+
         t0   = timeit.default_timer()
         pool = mp.Pool(processes=nc, initializer=worker_init, initargs=(log_queue,))
         for args in allargs:
@@ -1109,30 +1157,31 @@ def hydrophobics(
         # ── Interchain ───────────────────────────────────────────────────────
         t0 = timeit.default_timer()
         for c2 in cs[1:]:
-            sel_2_hc = selections.get(c2, {}).get('HC')
- 
-            if sel_2_hc is None:
-                log.info(f'  Chains {c1}/{c2}: no HC selection for {c2} – interchain skipped.\n')
+            sel_2_hc = selections.get(c2, {}).get('HC', {})
+            if not sel_2_hc:
+                log.info(f'  Chains {c1}/{c2}: no HC selection for {c2} – skipped.\n')
                 continue
- 
-            if not isinstance(sel_2_hc, dict):
-                log.info(f'  Chains {c1}/{c2}: HC selection for {c2} is not a dict – skipped.\n')
-                continue
- 
+
+            sel_2_hc_str: Dict[str, str] = {}
             n_atoms2 = 0
-            for sel_str in sel_2_hc.values():
-                keep_running = check_selection(u, sel_str)
-                if not keep_running:
+            keep_running = True
+            for label, (sel_str, expected) in sel_2_hc.items():
+                if sel_str is None:
+                    continue
+                if not check_selection(u, sel_str, expected=expected):
+                    keep_running = False
                     break
-                
-                n_atoms2 += len(u.select_atoms(sel_str))
-            log.info(f'Chain {c2}: {len(sel_2_hc)} HC groups, {n_atoms2} atoms total')
- 
+                sel_2_hc_str[label] = sel_str
+                n_atoms2 += expected
+            if not keep_running:
+                break
+            log.info(f'Chain {c2}: {len(sel_2_hc_str)} HC groups, {n_atoms2} atoms total')
+
             fname = f'{c1}_{c2}_HC'
             outnames.append(fname)
             allargs = [
-                (top, trj, mf, sel_1_hc, cutoff, outpath, fname,
-                 ram_thr, sel_2_hc, 'hc')
+                (top, trj, mf, sel_1_hc_str, cutoff, outpath, fname,
+                 ram_thr, sel_2_hc_str, 'hc')
                 for mf in frames
             ]
             pool = mp.Pool(processes=nc, initializer=worker_init, initargs=(log_queue,))
@@ -1170,7 +1219,7 @@ def merge_results(
     for outname in outnames:
         partials = [
             f for f in all_files
-            if f.name.startswith(outname) and not f.name.endswith('merged.csv')
+            if f.name.startswith(outname) and '_upto_' in f.name and not f.name.endswith('merged.csv')
         ]
         partials.sort(key=lambda x: int(x.stem.split('_')[-1]))
 

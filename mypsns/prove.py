@@ -35,6 +35,8 @@ for inttype, (truth_p, comp_p) in true_vs_computed.items():
         continue
 
     diff_mask  = ~np.isclose(true, computed, atol=1e-2)
+    same_mask  = np.isclose(true, computed, atol=1e-2)
+    same_rows, same_cols = np.where(same_mask)
     rows, cols = np.where(diff_mask)
 
     for r, c in zip(rows, cols):
@@ -70,8 +72,20 @@ for inttype, (truth_p, comp_p) in true_vs_computed.items():
                 'intertype': inttype,
                 'difference': t - k,
             })
+    
+    for r, c in zip(same_rows, same_cols):
+        if r <= c: 
+            continue
+        t, k = true[r, c], computed[r, c]
+        mydiff = abs(k - t)
+        diff += mydiff
+        true_tot += t
+        computed_tot += k
 
-    print(f'{inttype}: {len(rows)} differing entries')
+    print(f'  true:     min={true.min():.4g}  max={true.max():.4g}  mean(>0)={true[true>0].mean():.4g}')
+    print(f'  computed: min={computed.min():.4g}  max={computed.max():.4g}  mean(>0)={computed[computed>0].mean():.4g}')
+
+    print(f'{inttype}: {len(rows)} differing entries - {len(same_rows)} similar entries')
     print(f'True total: {true_tot}, coomputed total: {computed_tot} observed difference abs(computed - true): {diff}\n% difference: {(diff / true_tot) * 100}')
 
 

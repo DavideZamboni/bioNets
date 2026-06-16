@@ -115,9 +115,14 @@ def network(
         help="Seed for stochastic community algorithms.",
         rich_help_panel=PANEL_METRICS,
     ),
-    min_frequency: Optional[float] = typer.Option(
-        None, "--min-frequency",
-        help="Drop edges with summed weight below this value.",
+    min_persistency: Optional[float] = typer.Option(
+        None, "--min-persistency",
+        help="Drop persistency edges with summed weight \u2264 this (percent, 0..100).",
+        rich_help_panel=PANEL_FILTER,
+    ),
+    min_energy: Optional[float] = typer.Option(
+        None, "--min-energy",
+        help="Drop energy edges with summed weight \u2264 this (kJ/mol, post-transform).",
         rich_help_panel=PANEL_FILTER,
     ),
     min_degree: Optional[int] = typer.Option(
@@ -193,7 +198,8 @@ def network(
         "node_metrics":        node_metrics,
         "community_methods":   community_methods,
         "community_seed":      community_seed,
-        "min_frequency":       min_frequency,
+        "min_persistency":     min_persistency,
+        "min_energy":          min_energy,
         "min_degree":          min_degree,
         "reference_pdb":       reference_pdb,
         "sphere_scale":        sphere_scale,
@@ -255,8 +261,9 @@ def network(
         "community_seed":    cfg.network.community_seed,
     })
     print_summary("Filters", {
-        "min_frequency": cfg.network.min_frequency,
-        "min_degree":    cfg.network.min_degree,
+        "min_persistency": cfg.network.min_persistency,
+        "min_energy":      cfg.network.min_energy,
+        "min_degree":      cfg.network.min_degree,
     })
     print_summary("PyMOL", {
         "sphere_scale":   cfg.network.sphere_scale,
@@ -301,7 +308,8 @@ def network(
                 targets             = cfg.network.targets,
                 edge_weight_sources = cfg.network.edge_weight_sources,
                 energy_use_abs      = cfg.network.energy_use_abs,
-                min_value           = cfg.network.min_frequency,
+                min_persistency     = cfg.network.min_persistency,
+                min_energy          = cfg.network.min_energy,
                 frame_start         = cfg.network.frame_start,
                 frame_stop          = cfg.network.frame_stop,
             )
@@ -342,7 +350,7 @@ def network(
                     window_size      = cfg.network.window_size,
                     stride           = cfg.network.window_stride,
                     energy_use_abs   = cfg.network.energy_use_abs,
-                    min_value        = cfg.network.min_frequency,
+                    min_energy       = cfg.network.min_energy,
                     frame_start      = cfg.network.frame_start,
                     frame_stop       = cfg.network.frame_stop,
                 )

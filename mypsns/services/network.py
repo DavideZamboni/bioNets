@@ -57,7 +57,8 @@ from mypsns.utils.network_utilities import (
     filter_by_degree, filter_by_weight,
     write_edge_csv, write_graphml, write_node_csv, write_pymol_session,
 )
-from mypsns.utils.topology_recognition_utilities import get_endtime
+from mypsns.utils.general_utilities import get_endtime
+from mypsns.utils.contacts_utilities import assemble_full_interactors
 
 pd.options.mode.chained_assignment = None
 log = logging.getLogger(__name__)
@@ -70,6 +71,26 @@ _NA_VALUES: List[str] = [
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _threshold_for_source(
+    source:          str,
+    min_persistency: float,
+    min_energy:      float,
+) -> float:
+    """Pick the per-source edge threshold.
+
+    persistency graphs are on a 0..100 % scale → use min_persistency.
+    energy graphs are on a kJ/mol (post-transform) scale → use min_energy.
+    Any other source falls back to 0.0 (no filtering).
+    """
+    if source == 'persistency':
+        return min_persistency
+    if source == 'energy':
+        return min_energy
+    return 0.0
+
 
 def _build_graph_from_pairs(
     pairs:    pd.DataFrame,
@@ -150,17 +171,29 @@ class Network:
                  self.adjacency_root, self.interactors_root, self.out,
                  self.n_frames if self.n_frames is not None else 'all')
 
-        # ── whole_topology_interactors ──────────────────────────────────────
-        int_top_path = self.interactors_root / 'whole_topology_interactors.csv'
-        if not int_top_path.exists():
+        # ── Interactors table ────────────────────────────────────────────────
+        # Reconstructed in memory from the three normalised files Interactors
+        # writes (found_topologies/<variant>.csv, residue_index.csv,
+        # atom_index_map.csv) — exactly as Contacts does. There is no monolithic
+        # whole_topology_interactors.csv on disk (kept normalised to stay small).
+        residue_index_path  = self.interactors_root / 'residue_index.csv'
+        atom_index_map_path = self.interactors_root / 'atom_index_map.csv'
+        found_topologies_dir = self.interactors_root / 'found_topologies'
+        missing = [p for p in (residue_index_path, atom_index_map_path,
+                               found_topologies_dir) if not p.exists()]
+        if missing:
             raise FileNotFoundError(
-                f'whole_topology_interactors.csv not found in '
-                f'{self.interactors_root.absolute()}.  '
+                f'Interactors output incomplete in {self.interactors_root.absolute()} '
+                f'(missing: {[p.name for p in missing]}). '
                 'Run Topology_recognition / Interactors first.'
             )
-        self.int_top = pd.read_csv(int_top_path, header=0, index_col=False,
-                                   na_values=self.nas)
-        log.info('whole_topology_interactors: %d atoms, %d residues',
+        self.int_top = assemble_full_interactors(
+            found_topologies_dir = found_topologies_dir,
+            residue_index_path   = residue_index_path,
+            atom_index_map_path  = atom_index_map_path,
+            na_values            = self.nas,
+        )
+        log.info('interactors table: %d atoms, %d residues',
                  self.int_top.shape[0], self.int_top['Resindex'].nunique())
 
         # ── Resindex → (chain, PDB resid) for PyMOL ──────────────────────────
@@ -182,7 +215,8 @@ class Network:
         targets:             List[str],
         edge_weight_sources: List[str],
         energy_use_abs:      bool  = False,
-        min_value:           float = 0.0,
+        min_persistency:     float = 0.0,
+        min_energy:          float = 0.0,
         frame_start:         Optional[int] = None,
         frame_stop:          Optional[int] = None,
     ) -> None:
@@ -201,7 +235,7 @@ class Network:
 
         Parameters
         ----------
-        interactors_type : list of {'q_interactors', 'named_interactors'}
+        interactors_type : list of {'q', 'named'}
             Sub-folders of Adjacency/ to consume.
         targets : list of {'Salt_bridges', 'HBonds', 'HCs'}
             Contact types contributing to each graph.
@@ -210,8 +244,12 @@ class Network:
         energy_use_abs : bool
             False (default) → attractive-only: weight = max(0, -E).
             True            → absolute:        weight = |E|.
-        min_value : float
-            Drop edges whose summed weight is at or below this.
+        min_persistency : float
+            Persistency-graph edge threshold (percent, 0..100). Edges with
+            summed weight ≤ this are dropped.
+        min_energy : float
+            Energy-graph edge threshold (kJ/mol, post-transform). Edges with
+            summed weight ≤ this are dropped.
         frame_start, frame_stop : int, optional
             If either is set, re-aggregate from per-frame CSVs over
             ``[frame_start, frame_stop)``.
@@ -219,7 +257,8 @@ class Network:
         if frame_start is not None or frame_stop is not None:
             return self._load_static_from_per_frame(
                 interactors_type, targets, edge_weight_sources,
-                energy_use_abs, min_value, frame_start, frame_stop,
+                energy_use_abs, min_persistency, min_energy,
+                frame_start, frame_stop,
             )
 
         start = timeit.default_timer()
@@ -238,12 +277,14 @@ class Network:
                     log.warning('load_static: no matrices for %s/%s — skipped',
                                 inttype, source)
                     continue
+                min_value = _threshold_for_source(source, min_persistency, min_energy)
                 pairs = matrix_to_pairs(mat, labels, value_name='weight',
                                         min_value=min_value)
                 G = _build_graph_from_pairs(pairs, self.int_top, weight_col='weight')
                 self.graphs[(inttype, source)] = G
-                log.info('  %s/%s graph: %d nodes, %d edges',
-                         inttype, source, G.number_of_nodes(), G.number_of_edges())
+                log.info('  %s/%s graph: %d nodes, %d edges (min_value=%g)',
+                         inttype, source, G.number_of_nodes(),
+                         G.number_of_edges(), min_value)
 
         proc_time, total_time = get_endtime(start, self.start)
         log.info('load_static complete | took %s (h:m:s), total %s (h:m:s)',
@@ -257,11 +298,17 @@ class Network:
         targets:             List[str],
         edge_weight_sources: List[str],
         energy_use_abs:      bool,
-        min_value:           float,
+        min_persistency:     float,
+        min_energy:          float,
         frame_start:         Optional[int],
         frame_stop:          Optional[int],
     ) -> None:
-        """Frame-range path for load_static — uses per-frame energy CSVs."""
+        """Frame-range path for load_static — uses per-frame energy CSVs.
+
+        Persistency is scaled to percent (0..100) so the value and the
+        ``min_persistency`` threshold mean the same thing as in the
+        matrix-based path. Energy is mean-per-frame weight (kJ/mol).
+        """
         start = timeit.default_timer()
 
         for inttype in interactors_type:
@@ -304,13 +351,15 @@ class Network:
                 elif source == 'persistency':
                     pers = (df.groupby(['target', 'res_1', 'res_2'])['frame']
                               .nunique().reset_index(name='hit'))
-                    pers['weight'] = pers['hit'] / n_frames_eff
+                    # percent, to match the matrix-based persistency convention
+                    pers['weight'] = pers['hit'] / n_frames_eff * 100.0
                     agg = pers.groupby(['res_1', 'res_2'], as_index=False)['weight'].sum()
                 else:
                     log.warning('load_static (per-frame): unknown source %r — skipped',
                                 source)
                     continue
 
+                min_value = _threshold_for_source(source, min_persistency, min_energy)
                 agg = agg[agg['weight'] > min_value]
                 if agg.empty:
                     log.warning('  %s/%s: no edges above min_value=%g',
@@ -318,8 +367,9 @@ class Network:
                     continue
                 G = _build_graph_from_pairs(agg, self.int_top, weight_col='weight')
                 self.graphs[(inttype, source)] = G
-                log.info('  %s/%s graph (per-frame): %d nodes, %d edges',
-                         inttype, source, G.number_of_nodes(), G.number_of_edges())
+                log.info('  %s/%s graph (per-frame): %d nodes, %d edges (min_value=%g)',
+                         inttype, source, G.number_of_nodes(),
+                         G.number_of_edges(), min_value)
 
         proc_time, total_time = get_endtime(start, self.start)
         log.info('load_static (per-frame) complete | took %s (h:m:s), total %s (h:m:s)',
@@ -430,7 +480,7 @@ class Network:
         window_size:      int,
         stride:           Optional[int] = None,
         energy_use_abs:   bool  = False,
-        min_value:        float = 0.0,
+        min_energy:       float = 0.0,
         frame_start:      Optional[int] = None,
         frame_stop:       Optional[int] = None,
     ) -> None:
@@ -447,8 +497,9 @@ class Network:
             Step between windows (defaults to ``window_size`` — non-overlapping).
         energy_use_abs : bool
             Per-row weight: ``|energy_total|`` if True, else ``max(0, -energy_total)``.
-        min_value : float
-            Drop edges (per window) whose total summed weight is at or below this.
+        min_energy : float
+            Drop edges (per window) whose total summed weight is at or below this
+            (kJ/mol, post-transform). Windowed graphs are always energy-sourced.
         frame_start, frame_stop : int, optional
             Restrict the per-frame data to ``[frame_start, frame_stop)``. Either
             or both may be None — None means "no bound on that side". When both
@@ -499,7 +550,7 @@ class Network:
 
             for window_start, gdf in wdf.groupby('window_start'):
                 pairs = gdf[['res_1', 'res_2', 'weight']]
-                pairs = pairs[pairs['weight'] > min_value]
+                pairs = pairs[pairs['weight'] > min_energy]
                 if pairs.empty:
                     continue
                 G = _build_graph_from_pairs(pairs, self.int_top, weight_col='weight')
@@ -648,19 +699,24 @@ class Network:
 
     def apply_filter(
         self,
-        key:           Tuple[str, str],
-        min_frequency: Optional[float] = None,
-        min_degree:    Optional[int]   = None,
+        key:        Tuple[str, str],
+        min_weight: Optional[float] = None,
+        min_degree: Optional[int]   = None,
     ) -> nx.Graph:
-        """Filtered copy of one static graph; ``self.graphs[key]`` untouched."""
+        """Filtered copy of one static graph; ``self.graphs[key]`` untouched.
+
+        ``min_weight`` is interpreted on the chosen graph's own scale
+        (persistency % or energy kJ/mol), since ``key`` already identifies the
+        source.
+        """
         if key not in self.graphs:
             raise KeyError(f'no static graph for {key!r}')
         H = self.graphs[key].copy()
-        if min_frequency is not None:
-            H = filter_by_weight(H, min_frequency)
+        if min_weight is not None:
+            H = filter_by_weight(H, min_weight)
         if min_degree is not None:
             H = filter_by_degree(H, min_degree)
         log.info('apply_filter %s: min_w=%s min_d=%s → %d nodes, %d edges',
-                 key, min_frequency, min_degree,
+                 key, min_weight, min_degree,
                  H.number_of_nodes(), H.number_of_edges())
         return H

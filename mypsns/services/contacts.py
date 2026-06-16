@@ -23,10 +23,11 @@ import timeit
 from logging.handlers import QueueListener
 from os import makedirs
 from pathlib import Path
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 import MDAnalysis as mda
 import numpy as np
+import pandas as pd
 
 from mypsns.utils.contacts_utilities import (
     generate_combinations,
@@ -45,7 +46,7 @@ from mypsns.utils.contacts_utilities import (
     threshold_analysis,
     load_lj_params,
     energy_to_percentage,
-    get_hc_energy
+    get_hc_energy,
 )
 log = logging.getLogger(__name__)
 
@@ -219,10 +220,11 @@ class Contacts:
             makedirs(myout, exist_ok=True)
             
             seles = self.build_selections(inttype)
-            log.info('Selections built:', seles)
+            log.info('Selections built: %s', seles)
             log.info(f'Will run contacts with parameters:\ntopology: {self.top}')
             log.info(f'trajectory: {self.trj.resolve()}')
-            log.info(f'frames to be analyzed: {myframes}')
+            boundary_str = [f"{f[0]} to {f[-1]}" for f in myframes]
+            log.info(f'frames to be analyzed: {boundary_str}')
             
             log.info(f'SB output folder: {(myout / "Salt_bridges").absolute()}')
             log.info(f'HB output folder: {(myout / "H_bonds").absolute()}')
@@ -362,7 +364,7 @@ class Contacts:
             threshold_analysis(
                 per_type,
                 outdir=intfolder / 'graph_report',
-                step=self.defaults.get('persistency_step', 0.1),
+                step=self.defaults.get('thr_step', 0.1),
                 nc=self.defaults.get('nc', 1),
             )
 
@@ -425,7 +427,9 @@ class Contacts:
                     for _ch, roles in seles.items():
                         hc = roles.get('HC')
                         if isinstance(hc, dict):
-                            hc_label_sel.update(hc)        # labels carry Resindex → globally unique
+                            for label, (sel_str, _) in hc.items():
+                                if sel_str is not None:
+                                    hc_label_sel[label] = sel_str
                     get_hc_energy(hc_files, self.inters, hc_label_sel, self.top, self.trj,
                                   n_frames, intfolder, lj_lookup, na_values=self.nas)
 
@@ -439,8 +443,8 @@ class Contacts:
                         emats[kind] = m
             if emats:
                 report = intfolder / 'energy_graph_report'
-                use_abs = self.defaults.get('energy_use_abs', True)
-                step    = self.defaults.get('persistency_step', 0.1)
+                use_abs = self.defaults.get('energy_use_abs', False)
+                step    = self.defaults.get('thr_step', 0.1)
                 nc      = self.defaults.get('nc', 1)
 
                 # total interaction energy across all types (element-wise sum)
@@ -464,29 +468,29 @@ class Contacts:
     # Private helpers
     # ──────────────────────────────────────────────────────────────────────────
 
+    # ──────────────────────────────────────────────────────────────────────────
+    # Private helpers
+    # ──────────────────────────────────────────────────────────────────────────
+
     def build_selections(
         self,
         inttype: str,
-    ) -> Dict[str, Dict[str, str]]:
+    ) -> Dict[str, Dict[str, Union[Tuple[str, int], Dict[str, Tuple[str, int]]]]]:
         """
         Build MDAnalysis selection strings for every chain and requested
         interaction role (HBond, HAcc, HDon, Acidic, Basic, HC).
 
-        Parameters
-        ----------
-        inttype : str
-            Column name in ``self.inters``
-            (e.g. ``'PIE_classification'``).
-
         Returns
         -------
         dict
-            ``{chain_id: {role: selection_string}}``
+            ``{chain_id: {role: (sel_str, expected_atom_count)}}``, except for
+            HC which carries a per-cluster sub-dict
+            ``{label: (sel_str, expected_atom_count)}``. Chains/roles with no
+            tagged atoms are omitted.
         """
         targets = self.defaults["targets"]
-        all_chains = set(self.defaults["surrounding_chains"]) | set(
-            self.defaults["subject_chains"]
-        )
+        all_chains = sorted(set(self.defaults["surrounding_chains"]) |
+                            set(self.defaults["subject_chains"]))
 
         role_map: Dict[str, List[str]] = {
             "HBonds":       ["HBond", "HAcc", "HDon"],
@@ -497,16 +501,24 @@ class Contacts:
         for t in targets:
             roles_needed.extend(role_map.get(t, []))
 
-        seles: Dict[str, Dict[str, str]] = {}
+        seles: Dict[str, Dict[str, Union[Tuple[str, int],
+                                         Dict[str, Tuple[str, int]]]]] = {}
         for chain in all_chains:
             chain_df = self.inters[self.inters["Chain"] == chain]
-            seles[chain] = {}
+            if chain_df.empty:
+                continue
+
+            chain_seles: Dict[str, Union[Tuple[str, int],
+                                         Dict[str, Tuple[str, int]]]] = {}
             for role in roles_needed:
                 sel = get_selection(chain_df, inttype, role, chainID=chain)
-                if sel is not None:
-                    seles[chain][role] = sel
-                    log.info(f"  Chain {chain} | {role}: {sel}")
-                else:
+                if sel is None:
                     log.info(f"  Chain {chain} | {role}: no atoms found")
+                    continue
+                chain_seles[role] = sel
+                log.info(f"  Chain {chain} | {role}: {sel}")
+
+            if chain_seles:
+                seles[chain] = chain_seles
 
         return seles

@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any, List, Literal, Optional
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 
 # Default NA strings shared across CSV reads in the pipeline.
@@ -179,19 +179,50 @@ class NetworkConfig(BaseModel):
     """Configuration for the network stage (standalone — not in `run`)."""
 
     model_config = ConfigDict(extra="forbid")
-    # ── Frame count (needed to normalise frequencies) ──
+    # ── Frame count (informational — logged only, not required) ──
     n_frames: Optional[int] = Field(
         default=None, ge=1,
-        description="Trajectory frames analysed during Contacts. Required.",
+        description="Trajectory frames analysed during Contacts. Optional; logged only.",
     )
     # ── Which contact tables to consume ──
-    interactors_type: List[Literal["q_interactors", "named_interactors"]] = Field(
-        default_factory=lambda: ["q_interactors", "named_interactors"],
+    interactors_type: List[Literal["q", "named"]] = Field(
+        default_factory=lambda: ["q", "named"],
         description="Adjacency/ sub-folders to scan.",
     )
     targets: List[Literal["HBonds", "Salt_bridges", "HCs"]] = Field(
         default_factory=lambda: ["HBonds", "Salt_bridges", "HCs"],
         description="Contact types contributing to the network.",
+    )
+    # ── Edge-weight source(s): persistency-based, energy-based, or both ──
+    edge_weight_sources: List[Literal["persistency", "energy"]] = Field(
+        default_factory=lambda: ["persistency", "energy"],
+        description=("Build one static network per entry. 'persistency' uses the "
+                     "*_adjacency.dat matrices; 'energy' uses *_total_energy.dat."),
+    )
+    energy_use_abs: bool = Field(
+        default=False,
+        description=("Energy → weight transform. False: weight = max(0, -E) "
+                     "(attractive only). True: weight = |E| (also repulsive)."),
+    )
+    # ── Time-resolved energy network (optional) ──
+    window_size: Optional[int] = Field(
+        default=None, ge=1,
+        description=("If set, also build one network per window of this many frames "
+                     "from the per-frame energy CSVs and write community_evolution_*.csv."),
+    )
+    window_stride: Optional[int] = Field(
+        default=None, ge=1,
+        description="Step between windows. Defaults to window_size (non-overlapping).",
+    )
+    # ── Frame range (applies to BOTH static and time-resolved) ──
+    frame_start: Optional[int] = Field(
+        default=None, ge=0,
+        description=("First frame (inclusive). When set, static networks are "
+                     "re-aggregated from the per-frame energy CSVs over the range."),
+    )
+    frame_stop: Optional[int] = Field(
+        default=None, ge=1,
+        description="Last frame (exclusive). None → end of trajectory.",
     )
     # ── Output metrics (one .pml per node × community combination) ──
     node_metrics: List[Literal[
@@ -212,9 +243,17 @@ class NetworkConfig(BaseModel):
         description="Seed for stochastic community algorithms.",
     )
     # ── Filtering ──
-    min_frequency: float = Field(
-        default=0.0, ge=0.0, le=1.0,
-        description="Drop edges with weight (frequency) below this.",
+    # Edge thresholds are per-source: persistency graphs use min_persistency
+    # (0..100 %), energy graphs use min_energy (the transformed weight, i.e.
+    # max(0,-E) or |E| in kJ/mol). An edge is kept when its summed weight is
+    # strictly greater than the threshold for its source.
+    min_persistency: float = Field(
+        default=0.0, ge=0.0, le=100.0,
+        description="Drop persistency edges with summed weight ≤ this (percent, 0..100).",
+    )
+    min_energy: float = Field(
+        default=0.0, ge=0.0,
+        description="Drop energy edges with summed weight ≤ this (kJ/mol, post-transform).",
     )
     min_degree: int = Field(
         default=0, ge=0,
@@ -246,7 +285,8 @@ class NetworkConfig(BaseModel):
  
     # ── Validators: non-empty lists, drop duplicates ──
     @field_validator(
-        "interactors_type", "targets", "node_metrics", "community_methods",
+        "interactors_type", "targets", "edge_weight_sources",
+        "node_metrics", "community_methods",
     )
     @classmethod
     def _non_empty_unique(cls, v):
@@ -260,6 +300,16 @@ class NetworkConfig(BaseModel):
         if v is None or isinstance(v, Path):
             return v
         return Path(str(v)).expanduser()
+
+    @model_validator(mode="after")
+    def _check_frame_range(self):
+        if (self.frame_start is not None and self.frame_stop is not None
+                and self.frame_stop <= self.frame_start):
+            raise ValueError(
+                f"frame_stop ({self.frame_stop}) must be > frame_start "
+                f"({self.frame_start})"
+            )
+        return self
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Pipeline (top-level) configuration
@@ -283,6 +333,7 @@ class PipelineConfig(BaseModel):
     topology_recognition: TopologyConfig = Field(default_factory=TopologyConfig)
     interactors: InteractorsConfig = Field(default_factory=InteractorsConfig)
     contacts: ContactsConfig = Field(default_factory=ContactsConfig)
+    network: NetworkConfig = Field(default_factory=NetworkConfig)
 
     @field_validator(
         "topology", "trajectory", "forcefield", "outpath",

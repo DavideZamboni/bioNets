@@ -874,3 +874,124 @@ def write_graphml(
     nx.write_graphml(H, str(out))
     logging.info(f'write_graphml: graph written to {out}')
     return out
+
+def write_pymol_session(
+    G:                nx.Graph,
+    pdb_path:         Union[str, Path],
+    outpath:          Path,
+    node_metric:      str,
+    centrality_df:    pd.DataFrame,
+    community_df:     pd.DataFrame,
+    community_method: str,
+    resindex_to_pdb:  Optional[Dict[int, Tuple[str, int]]] = None,
+    sphere_scale:     float = 2.0,
+    stick_scale:      float = 0.5,
+    filename:         str   = 'network.pml',
+) -> Path:
+    '''
+    Write a PyMOL ``.pml`` script that renders the residue-interaction network
+    on top of the reference structure.
+
+    Nodes
+        One CA sphere per residue, vdw radius scaled linearly by ``node_metric``
+        (a column of ``centrality_df``) up to ``sphere_scale`` Å, coloured by the
+        residue's community (from ``community_df``).
+    Edges
+        One ``distance`` object per graph edge, dash radius scaled by edge weight
+        up to ``stick_scale`` Å. Intra-community edges take the community colour;
+        cross-community edges use ``_PYMOL_CROSS_COLOR``.
+
+    Residue selectors use ``chain X and resi N`` with the PDB residue number from
+    ``resindex_to_pdb``; if a residue is missing from the map, that node/edge is
+    skipped (it cannot be addressed in PyMOL reliably).
+
+    Returns the Path to the written script.
+    '''
+    outpath = Path(outpath)
+    out = outpath / filename
+    resindex_to_pdb = resindex_to_pdb or {}
+
+    # ── metric → per-residue sphere radius ───────────────────────────────────
+    if node_metric not in centrality_df.columns:
+        logging.warning('write_pymol_session: metric %r absent — spheres flat', node_metric)
+        metric_by_res: Dict[int, float] = {}
+    else:
+        m = centrality_df.set_index('resindex')[node_metric].astype(float)
+        mmax = float(m.max()) if len(m) else 0.0
+        metric_by_res = (m / mmax).to_dict() if mmax > 0 else {r: 0.0 for r in m.index}
+
+    # ── community colour per residue ─────────────────────────────────────────
+    comm_by_res = dict(zip(community_df['resindex'].astype(int),
+                           community_df['community'].astype(int)))
+
+    def _colour(community_id: int) -> str:
+        return _PYMOL_PALETTE[community_id % len(_PYMOL_PALETTE)]
+
+    def _sel(resix: int) -> Optional[str]:
+        hit = resindex_to_pdb.get(int(resix))
+        if hit is None:
+            return None
+        chain, resnum = hit
+        if chain:
+            return f'chain {chain} and resi {resnum}'
+        return f'resi {resnum}'
+
+    # ── edge weight normalisation ────────────────────────────────────────────
+    weights = [d.get('weight', 0.0) for _, _, d in G.edges(data=True)]
+    wmax = max(weights) if weights else 0.0
+
+    lines: List[str] = [_PYMOL_PREAMBLE]
+    lines.append(f'load {Path(pdb_path).resolve()}, structure')
+    lines.append('hide everything, structure')
+    lines.append('show cartoon, structure')
+    lines.append('set cartoon_transparency, 0.6, structure')
+    lines.append('color grey80, structure')
+    lines.append('')
+
+    # ── nodes ────────────────────────────────────────────────────────────────
+    lines.append('# ── network nodes (CA spheres scaled by %s) ──' % node_metric)
+    n_nodes = 0
+    for resix, data in G.nodes(data=True):
+        sel = _sel(resix)
+        if sel is None:
+            continue
+        comm = comm_by_res.get(int(resix), 0)
+        colour = _colour(comm)
+        radius = 0.3 + sphere_scale * float(metric_by_res.get(int(resix), 0.0))
+        obj = f'node_{resix}'
+        lines.append(f'create {obj}, ({sel}) and name CA')
+        lines.append(f'show spheres, {obj}')
+        lines.append(f'set sphere_scale, {radius:.3f}, {obj}')
+        lines.append(f'color {colour}, {obj}')
+        n_nodes += 1
+    lines.append('')
+
+    # ── edges ────────────────────────────────────────────────────────────────
+    lines.append('# ── network edges (distance objects scaled by weight) ──')
+    n_edges = 0
+    for u, v, data in G.edges(data=True):
+        s1, s2 = _sel(u), _sel(v)
+        if s1 is None or s2 is None:
+            continue
+        cu = comm_by_res.get(int(u), 0)
+        cv = comm_by_res.get(int(v), 0)
+        colour = _colour(cu) if cu == cv else _PYMOL_CROSS_COLOR
+        w = float(data.get('weight', 0.0))
+        radius = 0.02 + stick_scale * (w / wmax if wmax > 0 else 0.0)
+        obj = f'edge_{u}_{v}'
+        lines.append(f'distance {obj}, ({s1}) and name CA, ({s2}) and name CA')
+        lines.append(f'hide labels, {obj}')
+        lines.append(f'set dash_radius, {radius:.3f}, {obj}')
+        lines.append(f'set dash_gap, 0, {obj}')
+        lines.append(f'color {colour}, {obj}')
+        n_edges += 1
+    lines.append('')
+    lines.append('group nodes, node_*')
+    lines.append('group edges, edge_*')
+    lines.append('set dash_round_ends, 1')
+    lines.append('orient structure')
+
+    out.write_text('\n'.join(lines) + '\n')
+    logging.info('write_pymol_session: %s (%d nodes, %d edges, community=%s)',
+                 out.name, n_nodes, n_edges, community_method)
+    return out

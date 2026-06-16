@@ -1,30 +1,4 @@
-energy + parser + 
-
-necessario sopprimere exception mdanalysis:
-         INFO     The attribute(s) types have already been read from the topology file. The guesser will only   
-                  guess empty values for this attribute, if any exists. To overwrite it by completely guessed   
-                  values, you can pass the attribute to the force_guess parameter instead of the to_guess one   
-         INFO     There is no empty types values. Guesser did not guess any new values for types attribute      
-         INFO     attribute masses has been guessed successfully.                                               
-         INFO     SB worker: frames 75001–87500                                                                 
-         INFO     starting core_sb                                                                              
-         INFO     SB worker: frames 87501–100000                                                                
-         INFO     The attribute(s) types have already been read from the topology file. The guesser will only   
-                  guess empty values for this attribute, if any exists. To overwrite it by completely guessed   
-                  values, you can pass the attribute to the force_guess parameter instead of the to_guess one   
-         INFO     There is no empty types values. Guesser did not guess any new values for types attribute      
-         INFO     attribute masses has been guessed successfully.                                               
-         INFO     The attribute(s) types have already been read from the topology file. The guesser will only   
-                  guess empty values for this attribute, if any exists. To overwrite it by completely guessed   
-                  values, you can pass the attribute to the force_guess parameter instead of the to_guess one   
-
-metti comando x identificazione forcefields in determinato path
 screenshots pipeline possible_topologies -> found manuale
-
-doppia threshold x ILE / LYS (Hbonds vs Acidic / Basic) fatto
-interaz repulsive? momentaneamente no
-
-rivedi pdb output (catene, ...)
 
 pymol
 - rappresentazione prop nodi come spehers con vdw centrati su CA modificabile (proporzionale a metrica)
@@ -41,312 +15,448 @@ globalprotect: von.univr.it
 
 
 
-# myPSNs
+## myPSNs
+Protein Structure Network analysis from molecular-dynamics trajectories.
+
+myPSNs builds residue–residue interaction networks (PSNs) from a GROMACS
+forcefield, a topology, and an MD trajectory. It identifies hydrogen bonds,
+salt bridges, and hydrophobic clusters per frame; aggregates them into
+persistency- and energy-weighted contact matrices; and constructs graphs with
+centrality, community detection, and PyMOL renderings.
+
+## Pipeline:
+
+ff-reader → topology → interactors → contacts → network
+
+The first four stages produce the contact data; network consumes it. network
+is not part of mypsns run — invoke it separately once contacts has
+finished.
 
 ## Setup
-NEW WORKFLOW:
-cd <proj_root/myPSN>
+
+cd <proj_root>/myPSN
 conda env create -f environment.yml
 conda activate mypsns
-
-```bash
-conda create -n mypsns python=3.11 numpy=1.26 pandas=2.2 psutil networkx=3.2 matplotlib=3.8 -c conda-forge
-conda activate mypsns
-pip install MDAnalysis
-pip install --upgrade pip setuptools wheel
-cd <proj_root>
 pip install -e .
-```
 
+This installs the mypsns console script. Verify with:
+
+mypsns --version
+mypsns --help
+
+## Quick start
+
+Run the contact pipeline (one of the two ways below), then build the network.
+
+With a config file (recommended)
 ## Run
 
-```bash
-python -c "from mypsns.main import main; main()"
+mypsns run     --config example_config.yaml
+mypsns network --config example_network_config.yaml
 
-```
+With explicit flags (minimal arguments)
 
-## Open issues
+mypsns run \
+  --topology   system.gro \
+  --forcefield charmm36.ff \
+  --trajectory traj.xtc \
+  --outpath    run_out
 
-- H2O parsing from the forcefield returns inconsistent rows:
-  ```
-  merged   HOH   OW    OT   -0.834   0   HW1 HW2   0.315057422683   0.63639     15.9994
-  merged   HOH   OW    OT   -0.834   0   HW1 HW2   0.315057422683   0.636386     9.9514
-  merged   HOH   HW1   HT    0.417   0   OW HW2    0                0            4.032
-  merged   HOH   HW1   HT    0.417   0   OW HW2    0                0            1.008
-  merged   HOH   HW1   HT    0.417   0   OW HW2    0.0400013524445  0.19246      4.032
-  merged   HOH   HW1   HT    0.417   0   OW HW2    0.0400013524445  0.19246      1.008
-  merged   HOH   HW2   HT    0.417   0   OW HW1    0                0            4.032
-  merged   HOH   HW2   HT    0.417   0   OW HW1    0                0            1.008
-  merged   HOH   HW2   HT    0.417   0   OW HW1    0.0400013524445  0.19246      4.032
-  merged   HOH   HW2   HT    0.417   0   OW HW1    0.0400013524445  0.19246      1.008
-  ```
-  As a temporary workaround, water is added to the resources DB for exact-match lookup at app start: `./resources/sol.csv`.
+mypsns network \
+  --topology system.gro \
+  --outpath  run_out \
+  --edge-weight-source persistency \
+  --edge-weight-source energy
+
+Any config value can be overridden on the command line; flags win over the YAML.
+Use --dry-run on any stage to validate inputs and print the plan without
+executing.
+
+## CLI commands
+
+| Command              | Purpose 
+|----------------------|----------------------
+| `mypsns run`         | Full pipeline (ff-reader → topology → interactors → contacts). 
+| `mypsns ff-reader`   | Parse a GROMACS forcefield folder. 
+| `mypsns topology`    | Match topology residues against the forcefield. 
+| `mypsns interactors` | Assign interaction roles to topology atoms. 
+| `mypsns contacts`    | Compute contacts across an MD trajectory. 
+| `mypsns network`     | Build residue-interaction networks and render PyMOL sessions. 
+| `mypsns guess_ff`    | Suggest candidate forcefield sub-folders under a path. 
+| `mypsns validate`    | Validate a config and its referenced files. 
+| `mypsns report`      | Summarise the outputs in a run folder. 
+
+Run `mypsns <command> --help` for the full option list of any stage.
 
 ## General notes
 
-### Project structure
+## Project structure
 
 ```
 mypsns/
-├── main.py
-├── parser_dispatcher.py
+├── cli.py                  console entry point (Typer)
+├── config.py               Pydantic config models
+├── commands/               one module per CLI subcommand
 ├── services/
 │   ├── ff_reader.py
 │   ├── topology_recognition.py
 │   ├── interactors.py
-│   └── contacts.py           
-├── utils/
-└── resources/
+│   ├── contacts.py         contact computation + matrices
+│   └── network.py          PSN construction + PyMOL
+├── utils/                  per-stage helper functions
+└── resources/              bundled lookup tables (e.g. sol.csv)
 ```
 
 ### Modules
 
-- **`main.py`** — application entry point. Calls `parser_dispatcher.py`.
+- **`cli.py`** — application entry point.
+  Configures automatically CLI reading function's parameter names and types (no argparse)
+  callback: runs first, reads the global flags (-v, -q, --log-file) and configures logging
+  Calls specific commands foud in contacts/*_cmd.py (through app.command).
 
-  TODO: handle optional parameters. Most important:
-  ```python
-  na_values: Optional[List[str]] = [
-      "", "#N/A", "#N/A N/A", "#NA", "-1.#IND", "-1.#QNAN",
-      "-NaN", "-nan", "1.#IND", "1.#QNAN", "<NA>", "N/A",
-      "NULL", "NaN", "n/a", "nan", "null"
-  ]
-  ```
-  Passed to every `pandas.read_csv()` across the app to identify NA/NaN entries.
-  Note: `"NA"` has been removed from the default list to preserve sodium atom names.
+- **`config.py`** 
+  source of truth for what parameters the pipeline accepts, what their types are, what their defaults are, and what constraints apply.
+  Any invalid value is caught HERE, before any pipeline code runs.
 
-- **`parser_dispatcher.py`**
+  Defines global DEFAULT_NA_VALUES (for pandas.readcsv, omitting NA to preserve sodium atom names) and a Pydantic model for each of the main modules.
 
-  Parameters:
-  - **required**:
-    - `topology` (str): topology file in any MDAnalysis-compatible format
-    - `general_output_folder`: created if it does not exist
-    - `ff_folder`: forcefield folder. Output goes to a folder named after `ff_folder` with `ff.` or `.ff` removed and `-` replaced by `_`. If `final_ff_residues.csv` is already present in `ff_folder`, it is treated as an `ff_reader` output folder and `ff_reader` is skipped.
+  Orchestrates whole application setup (flags > .yml > defaults) and writes complete yaml file
+## Services
 
-  Calls service-specific processes (the `.py` files in `mypsns/services/`).
-  TODO: terminal command parsing.
-  TODO: handle optional parameters.
+The `mypsns/services/` folder holds the modules that drive the pipeline.
+Expected execution order:
 
-### Services
+1. `ff_reader` — parse the GROMACS forcefield
+2. `topology_recognition` — match topology residues to forcefield entries
+3. `interactors` — reconstruct whole-system topology + assign interaction roles
+4. `contacts` — compute contacts over a trajectory and build matrices
+5. `network` — build residue-interaction networks (standalone; run after `contacts`)
 
-Folder containing the modules that drive the application pipeline. Expected execution order:
+Stages 1–4 are chained by `mypsns run`; `network` is invoked separately.
 
-1. `ff_reader` — parse the forcefield
-2. `topology_recognition` — match residues in topology to forcefield entries
-3. `interactors` — assemble whole-system topology + assign interaction roles
-4. `contacts` — compute contact statistics over a trajectory
+A note on `na_values`: every stage accepts an optional `na_values` list that is
+forwarded to every `pandas.read_csv`. The shared default deliberately **excludes
+`"NA"`** so sodium atoms/residues named `NA` are not parsed as missing. There is
+no `main.py`; the entry point is the `mypsns` console script (`mypsns/cli.py`),
+and per-stage options are set via the config file or CLI flags.
 
-#### `ff_reader.py`
+---
 
-Parameters:
-- **required**:
-  - `inpath`: ff_folder from the parser
-  - `outpath`: renamed folder from the parser (e.g. `charmm36_apr2019_vm` from `charmm36-apr2019_vm.ff`)
-- **optional**:
-  - `na_values`: see `main.py`
-  - `nonbonded_name` (default `"ffnonbonded.itp"`): file in the input folder containing nonbonded interaction parameters
-  - `additional_residues` (default `True`): whether to merge in extra residues from `resources/`
+### `ff_reader.py`
 
 GROMACS forcefield parser.
 
-1. Reads all residues defined in `.rtp` files. For each atom records:
-   - `rtp_file`: name of the source `.rtp` file
-   - `resname`: residue name (from rtp)
-   - `atom_name`: atom name (from rtp)
-   - `atom_type`: atom type (from rtp)
-   - `charge`: partial atomic charge (from rtp)
-   - `chargegroup`: integer grouping atoms whose total charge sums to an integer. Used by GROMACS to speed up Coulombic interactions when PME is off. (from rtp)
-   - `sigma`: σ in `C12 = 4εσ¹²` (from `ffnonbonded.itp`)
-   - `epsilon`: ε in `C6 = 4εσ⁶` (from `ffnonbonded.itp`)
-   - `mass`: atomic mass (from `ffnonbonded.itp`)
+**Parameters**
+- required:
+  - `inpath`: forcefield folder (the `.ff` directory)
+  - `outpath`: destination folder (e.g. `charmm36_apr2019_vm` from `charmm36-apr2019_vm.ff`)
+- optional:
+  - `na_values`: NA-string list (see note above)
+  - `nonbonded_name` (default `"ffnonbonded.itp"`): file holding nonbonded parameters
+  - `additional_residues` (default `True`): merge extra residues bundled in `resources/`
 
-2. Reads termini definitions from `.n.tdb` and `.c.tdb` files.
-   **The naming of `.rtp` and `.tdb` files must correspond.** E.g. if `merged.rtp` contains residues that can have termini, then `merged.n.tdb` / `merged.c.tdb` must also exist.
+**What it does**
 
-   The atom-definition format is the same as in `.rtp`, with the following bond-entry conventions:
-   - atoms starting with `-`, present in every bond entry of a ter, are the ones to be **found and removed** from the original residue definition
-   - atoms starting with `r`, present in only one specific atom of the ter entry, are the ones to be **found and replaced** with the atom defined in the ter entry; bonds are adjusted accordingly
+1. Reads every residue defined in the `.rtp` files. Per atom it records
+   `rtp_file`, `resname`, `atom_name`, `atom_type`, `charge`, `chargegroup`
+   (integer grouping whose total charge sums to an integer — a GROMACS device
+   for Coulomb cutoffs when PME is off), and from `ffnonbonded.itp` the
+   `sigma`, `epsilon`, and `mass`.
+2. Reads termini definitions from `.n.tdb` / `.c.tdb`. **`.rtp` and `.tdb`
+   names must correspond** (e.g. `merged.rtp` ↔ `merged.n.tdb` / `merged.c.tdb`).
+   Bond-entry conventions: atoms prefixed `-` (present in every bond entry of a
+   terminus) are **found and removed** from the residue; atoms prefixed `r` are
+   **found and replaced** with the terminus-defined atom, bonds adjusted.
+3. Reads σ and ε from the `.itp` named by `nonbonded_name`.
+4. Writes `final_ff_residues.csv` (`residues.csv` ⋈ `atomtypes_se.csv` on
+   `atom_type`, adding `mass`, `sigma`, `epsilon`) and `final_ff_ters.csv`
+   (the ters table, similarly joined). `atomtypes_se.csv` (atom type → σ, ε) is
+   also produced and is later consumed by `contacts` for energy calculations.
 
-3. Reads σ, C6 and epsilon C12 from the `.itp` file specified by `nonbonded_name`.
-   Reminder: GROMACS uses `U(r) = C12/r¹² − C6/r⁶`.
+**Expected inputs**: `*.rtp`, `*.tdb` (`.n.tdb` / `.c.tdb`, names matched to the
+`.rtp`), and the nonbonded `.itp`.
 
-4. Produces output files:
-   - `final_ff_residues.csv`: `residues.csv` LEFT JOIN `atomtypes_se.csv` on `atom_type` (adds `mass`, `sigma`, `epsilon`)
-   - `final_ff_ters.csv`: `ters.csv` LEFT JOIN `atomtypes_se.csv` on `atom_type` (adds `sigma`, `epsilon` — `mass` already present in `ters.csv`)
+---
 
-Expected input files:
-- `*.rtp`: GROMACS residue topology files
-- `*.tdb`: GROMACS termini database files (`.n.tdb` and `.c.tdb`), naming matched to the corresponding `.rtp`
-- `.itp` (default `ffnonbonded.itp`): nonbonded parameters
+### `topology_recognition.py`
 
+Matches each residue in the input topology to a forcefield entry from
+`ff_reader`. The same residue name appearing with different atom sets
+(e.g. terminal vs internal) is treated as distinct residue topologies.
 
+**Parameters**
+- required: `topology` (PDB/GRO/…), `outpath`, `ff_path` (the `ff_reader` output)
+- optional: `na_values`; `outlog` (log folder, defaults to `outpath`)
 
-topology_recognition.py
-Reads the input topology and matches each residue in it to a forcefield entry produced by ff_reader. Handles cases where the same residue name appears with different atom sets (e.g. terminal vs. internal residues) by treating each unique atom set as a distinct residue topology.
-Parameters:
+The constructor calls `parse_initial_topology_info`, writing
+`initial_topology_info.csv` — a per-atom table with whichever of `chainID`,
+`resindex`, `resid`, `resname`, `index`, `id`, `name`, `type`, `element`,
+`mass`, `charge` the topology format supports (columns that raise
+`NoDataError` for every atom are omitted). Special case: if the format supplies
+`type` but not `element` and the longest type string is ≤2 chars, `type` is
+copied into `element` (handles PDBs where atomic symbols land in the type column).
 
-required:
+**Methods**
 
-topology (str): topology file (PDB, GRO, …)
-outpath (Path): output folder
-ff_path (Path): forcefield folder produced by ff_reader
+- `get_restypes(verbose=False)` — group atoms into unique residue topologies by
+  exact atom-name set. Writes `<outpath>/resid_topologies/<resname>[_<n>]_rixs.txt`
+  (Resindex lists) and `<resname>[_<n>]_atoms.csv` (atom names + masses), plus
+  `different_residue_topologies.csv` indexing them. The `_<n>` suffix is dropped
+  for the first variant of a resname (`ALA_atoms.csv`, then `ALA_1_atoms.csv`, …).
+- `get_ff_parameters(verbose=False, maxToCheck=-1)` — associate each topology
+  residue with a forcefield entry. Candidates are sorted by name similarity
+  (`difflib.SequenceMatcher`); `maxToCheck` caps how many are inspected
+  (`-1` = all). Two passes: (1) exact atom-name-set match for candidates with the
+  right atom count; (2) on failure, apply each `.tdb` ter substitution and
+  re-check. Outcomes split into `found_residues` (exact, with/without ter subs)
+  and `best_choices` (ranked by atom overlap, then mass agreement on unmatched
+  atoms). Writes `found_topologies/<resname>_ff_atoms.csv` for matches,
+  `possible_topologies/<resname>_uncertain_atoms_<n>.csv` for candidates, and
+  `complete_residue_topologies.csv` (or `unmatching_residue_topologies.csv` if
+  any residue is unmatched).
 
+---
 
-optional:
+### `interactors.py`
 
-na_values (List[str]): see main.py
-outlog (str | Path): folder for log files. Defaults to outpath.
+Bridges `topology_recognition` and `contacts`: reconstructs full topology
+(chains, polymer back-bonds, ter chargegroups), deduplicates residues into
+unique chemical variants, and assigns interaction roles.
 
+**Parameters**
+- required: `topology` (same file as the rest of the pipeline);
+  `general_outpath` (must already contain `Topology_recognition/`)
+- optional: `na_values`; `outlog` (defaults to `general_outpath`)
 
+**Methods**
 
-The constructor immediately calls parse_initial_topology_info, which extracts everything MDAnalysis exposes per atom and writes:
+- `get_complete_topology()` — fills bidirectional bond info per residue type;
+  concatenates per-residue tables in memory; detects chain boundaries from
+  `+`-bond connectivity (polymers) and contiguous `rtp_file` runs (non-polymers);
+  stamps `Chain` and `Entity` (`P` polymer / `M` monomer); adds polymer
+  back-bonds (`-X` references); adjusts ter chargegroups for terminal polymer
+  residues; deduplicates residues by atom-level chemistry into unique variants.
+  Outputs to `<general_outpath>/Interactors/`:
+  - `found_topologies/<variant_id>.csv` — one CSV per unique residue chemistry
+    (`<resname>`, then `<resname>_v2`, `_v3`, … for subsequent variants).
+    Columns: `rtp_file, resname, atom_name, atom_type, charge, chargegroup, bonds, mass`.
+  - `residue_index.csv` — one row per residue instance:
+    `Resindex, resnum, Chain, Entity, variant_id`.
+  - `atom_index_map.csv` — one row per atom: `Resindex, atom_name, atom_index`.
+- `add_inttypes(**kwargs)` — appends interaction-role columns to each variant
+  CSV in place. Each variant is analysed in isolation; back-bonds remain in the
+  bonds strings but BFS terminates at the variant boundary.
+  - **`q_interactors`** (charge-based, PIE-style): H-bond `HAcc`/`HDon`/`HBond`
+    from partial charges + connectivity (`max_DA_charge`=−0.3, `min_H_charge`=0.3,
+    `DA_masses`=[14,16,19]); salt-bridge `Acidic`/`Basic` from recursive local
+    charge (`min_abs_charge`=0.75); `HC` flag + `HC_cluster` label for atoms with
+    `|charge| ≤ max_abs_charge` (0.27) and BFS distance `> min_bonds_to_charged`
+    (3) from any charged atom (`max_num_heavy_ats`=3).
+  - **`named_interactors`** (PyInteraph-compatible, name-based): AND-combined
+    `(attribute, [values])` / `not <attribute>` rules per role, with default rule
+    sets matching the original PyInteraph atom definitions; `HBond` H atoms are
+    filled afterwards by walking from `HDon` atoms via the bonds column.
 
-initial_topology_info.csv: per-atom table with whichever of these columns the topology supports — chainID, resindex, resid, resname, index, id, name, type, element, mass, charge. Columns for which every atom raises NoDataError are omitted.
+  Note: at variant level there is no cross-residue context, so the previous
+  3-residue BFS widening for HC classification no longer applies. Differences are
+  negligible for the standard amino-acid set, but verify HC labels on a
+  representative system if they look off.
 
-Note: available fields depend on the topology format — see https://userguide.mdanalysis.org/stable/topology_system.html#format-specific-attributes. Special case: if the topology supplies type but not element and the longest type string is ≤2 characters, the type values are copied into element (handles PDB files where atomic symbols land in the type column).
-Three public methods:
+## `contacts`
 
-get_restypes(verbose=False) — group atoms in the topology into unique residue topologies.
-For each residue name, iterates over all residue instances and groups them by their exact atom-name set. Multiple distinct atom-name sets → multiple "topologies" for the same residue name (e.g. N-terminal ALA differs from internal ALA in its atom list).
-Writes to <outpath>/resid_topologies/:
+Computes per-frame contacts and aggregates them into matrices. Reads
+`<outpath>/Interactors/`, writes `<outpath>/Adjacency/`.
 
-<resname>[_<n>]_rixs.txt: space-separated list of Resindex values that share this residue topology
-<resname>[_<n>]_atoms.csv: atom names and masses defining this topology
+### Key options
 
-The _<n> suffix is omitted for the first topology of a given resname; subsequent variants are _1, _2, … (e.g. ALA_atoms.csv for the first ALA topology found, ALA_1_atoms.csv for the second).
-Also writes <outpath>/different_residue_topologies.csv summarising the index. Columns: resname, atoms (atoms CSV filename), rixs (rixs txt filename).
-get_ff_parameters(verbose=False, maxToCheck=-1) — associate each unique residue topology with a specific forcefield entry.
-Parameters:
+| Flag                      | Default                               | Meaning  
+|---                        |---                                    |--- 
+| `--nc`                    | 2                                     | Parallel worker processes.  
+| `--ram-thresh`            | 80                                    | RAM-usage %% that triggers a flush
+| `--nframes`               | 500                                   | Initial H-bond batch size (grows adaptively). 
+| `--beg-frm` / `--end-frm` | 0 / -1                                | Frame range (`-1` = last frame). 
+| `--interactors-type`      | `q_interactors`, `named_interactors`  | Which role columns to consult. Repeatable.
+| `--target`                | `HBonds`, `Salt_bridges`, `HCs`       | Contact types to compute. Repeatable.
+| `--subject-chain`         | detected polymers                     | Chains that are the focus of contacts. Repeatable.
+| `--surrounding-chain`     | all chains                            | Candidate partner chains. Repeatable. 
+| `--d-a-dist`              | 4.5 Å                                 | H-bond donor–acceptor distance cutoff.
+| `--angle`                 | 150°                                  | H-bond donor–H–acceptor angle cutoff.
+| `--sb-cutoff`             | 3.5 Å                                 | Salt-bridge atom-pair distance cutoff.
+| `--hc-cutoff`             | 5.5 Å                                 | Hydrophobic-cluster centre-of-mass distance cutoff.
+| `--matrix-type`           | `persistency`, `energy`               | Which matrices to build after contacts. Repeatable.
+| `--energy-use-abs / --no-energy-use-abs` | Energy → strength %% mapping: `\|E\|` vs attractive-only `max(0, -E)`.
 
-verbose: write a separate residues_to_ff_association.log reporting the matching process
-maxToCheck (default -1): max number of forcefield entries to inspect per topology residue. -1 = inspect all. Forcefield residue names are sorted by similarity (via difflib.SequenceMatcher) to the topology residue name, so smaller values still cover the closest candidates first.
+Two interactor schemas can be requested independently:
 
-Two-pass matching:
+- **`named_interactors`** — PyInteraph-compatible, atom-name-based role rules.
+- **`q_interactors`** — charge- and connectivity-based roles (PIE-style).
+  Currently the less-validated of the two.
 
-Pass 1 (exact match): for each candidate ff residue with the right atom count, check whether its atom-name set matches the topology's exactly. First exact match wins.
-Pass 2 (ter substitutions): if Pass 1 fails, apply each .tdb ter substitution to every candidate ff residue and re-check. Atoms prefixed with - in the ter entry are removed; atoms prefixed with r are replaced; bonds are adjusted accordingly. Used to recognise N-/C-terminal variants and similar.
+### Selection strings
 
-Two outcome buckets per topology residue:
+Atom selections are emitted in a compact, human-readable form grouped by
+`(resname, atom-name set)`, e.g.
 
-found_residues: exact atom-name match (with or without ter substitutions)
-best_choices: no exact match; ranked by atom-name overlap and, where overlap is incomplete, by mass agreement on the unmatched atoms
+(chainID A) and (
+    (resname ASP and resid 81 109 116 and name OD1 OD2)
+    or (resname GLU and resid 11 14 16 and name OE1 OE2)
+)
 
-Outputs to <outpath>/:
+This assumes **atom names are unique within a residue** (true for standard
+protein/lipid topologies). If a residue has duplicate atom names, rename them in
+the input PDB / forcefield first.
 
-found_topologies/<resname>_ff_atoms.csv: forcefield topology (atom names, types, charges, bonds, masses, σ, ε) for each successfully matched residue
-possible_topologies/<resname>_uncertain_atoms_<n>.csv: top-scoring candidates for each unmatched residue (one file per candidate)
-complete_residue_topologies.csv if every residue matched exactly, else unmatching_residue_topologies.csv. Columns: resname, atoms, rixs, ff_atoms, unmatching_masses (+ possible_atoms in the unmatching case).
+### Workflow
 
+1. Reassemble a flat per-atom interactors table in memory from the three files
+   written by `interactors` (`found_topologies/<variant>.csv`,
+   `residue_index.csv`, `atom_index_map.csv`).
+2. Write a corrected-topology PDB (`<name>_correct.pdb`) with `Resindex` stamped
+   as `resid` and atom IDs aligned to `atom_index`. All subsequent MDAnalysis
+   operations use this topology.
+3. Split frames across `--nc` worker processes (PBC-aware distance kernels via
+   `capped_distance` / `self_capped_distance`).
+4. Per chain combination and contact type, dispatch workers; each streams its
+   frame chunk to partial CSVs `<name>_upto_<lastframe>.csv`, flushing whenever
+   RAM hits the ceiling.
+5. Merge partials into `<name>_merged.csv` per chain combination.
+6. Aggregate merged CSVs into per-residue-pair tables `SB_final.csv`,
+   `Hbonds_final.csv`, `HC_final.csv`
+   (`res_1, res_2, n_frames_contact, mean_dist, chain_1, chain_2, label_1, label_2`).
+7. **Persistency matrices** — `{SB,Hbonds,HC}_adjacency.dat` (entry `[i,j]` is
+   the contact persistency in %) plus `combined_adjacency.dat` (frame-union).
+8. **Energy matrices** — `{SB,Hbonds,HC}_{LJ,Coulomb,total}_energy.dat`
+   (mean-per-frame LJ + Coulomb, kJ/mol). Energy is computed with constant
+   memory: per-frame rows stream to `<name>_energy.csv` companions, never
+   accumulating the whole trajectory in RAM.
+9. **Threshold analysis** — for every non-empty subset of the requested types,
+   scan the edge threshold and record the largest connected component +
+   degree distribution (elbow plots), to help pick a downstream cutoff.
 
-
-interactors.py
-Bridges topology_recognition and contacts. Reads the per-residue forcefield matches produced by topology_recognition, reconstructs full topology info (chains, polymer back-bonds, ter chargegroups), deduplicates residues into unique chemical variants, and assigns interaction roles to each variant.
-Parameters:
-
-required:
-
-topology (str): same topology file as the rest of the pipeline
-general_outpath (str | Path): root output folder. Must already contain a Topology_recognition/ subfolder produced by topology_recognition.
-
-
-optional:
-
-na_values (List[str]): see main.py
-outlog (str | Path): folder for log files. Defaults to general_outpath.
-
-
-
-Two public methods:
-
-get_complete_topology()
-
-fills bidirectional bond info per residue type
-concatenates per-residue dataframes into one whole-topology table (in memory only)
-detects chain boundaries from +-bond connectivity (polymer detection) and from contiguous rtp_file runs (non-polymers)
-stamps Chain and Entity (P polymer / M monomer)
-adds polymer back-bonds (-X references in the bonds column)
-adjusts ter chargegroups for terminal polymer residues
-deduplicates residues by their atom-level chemistry (after back-bonds and ter adjustments) into unique variants
-
-Outputs to <general_outpath>/Interactors/:
-
-found_topologies/<variant_id>.csv: one CSV per unique residue chemistry. <variant_id> is <resname> for the first variant of a residue type, then <resname>_v2, _v3, … for subsequent ones (e.g. ALA.csv for internal alanine, ALA_v2.csv for N-terminal, ALA_v3.csv for C-terminal). Columns: rtp_file, resname, atom_name, atom_type, charge, chargegroup, bonds, mass.
-residue_index.csv: one row per residue instance. Columns: Resindex, resnum, Chain, Entity, variant_id.
-atom_index_map.csv: one row per atom in the trajectory. Columns: Resindex, atom_name, atom_index.
-
-
-add_inttypes(**kwargs)
-Iterates over the per-variant CSVs and appends interaction-role columns in place. Each variant is analysed in isolation (no cross-residue context); polymer back-bonds are still present in the bonds strings but BFS terminates at the variant boundary.
-
-q_interactors (charge-based, PIE-style):
-
-HBonds — HAcc / HDon / HBond based on partial charges and connectivity. Tunable kwargs: max_DA_charge (default −0.3), min_H_charge (0.3), DA_masses ([14, 16, 19] for N/O/F).
-Salt bridges — Acidic / Basic from the recursive local charge of an atom + its terminal subtree. Tunable: min_abs_charge (0.75).
-Hydrophobic clusters — HC flag plus an HC_cluster group label, restricted to atoms with |charge| ≤ max_abs_charge and BFS distance > min_bonds_to_charged from any charged atom. Tunable: max_abs_charge (0.27), max_num_heavy_ats (3), min_bonds_to_charged (3).
-
-
-named_interactors (PyInteraph-compatible, name-based):
-
-rules of the form (attribute, [values]) or not <attribute>-prefixed, AND-combined per role
-default rule sets cover HDon, HAcc, HC, Basic, Acidic matching the original PyInteraph atom definitions
-HBond H atoms filled afterwards by walking from HDon atoms via the bonds column
-
-Each variant CSV is read, analysed, and overwritten with two added columns (q_interactors, named_interactors) plus an optional HC_cluster.
-Note on cross-residue context: at variant-level analysis, the polymer 3-residue BFS widening that the previous version applied for HC classification is no longer in effect. Differences are negligible for the standard amino-acid set (charged neighbour atoms rarely sit within min_bonds_to_charged=3 bond hops of a candidate HC atom via the backbone), but worth verifying on a representative trajectory if HC labels look off.
-#### `contacts.py` (formerly `adjacency.py`)
-
-Computes contact statistics across an MD trajectory using the per-variant tables produced by `interactors`.
-
-Parameters:
-- **required**:
-  - `topology` (str): same topology file as the rest of the pipeline
-  - `trajectory` (str): MD trajectory file (any format MDAnalysis can read)
-  - `general_outpath`: same root folder. Reads from `<general_outpath>/Interactors/`, writes to `<general_outpath>/Contacts/`.
-- **optional** (with defaults):
-  - `nc` (`2`): number of parallel workers
-  - `ram_thresh` (`80`): RAM-usage percentage that triggers batch-size freezing for H-bond computation
-  - `nframes` (`500`): initial frame batch size for adaptive H-bond batching
-  - `beg_frm` (`0`), `end_frm` (`-1`): frame range to analyse (`-1` = last frame)
-  - `interactors_type` (`['named_interactors']`): which interaction-role columns to consult on the variant tables. Allowed: `'q_interactors'`, `'named_interactors'`.
-  - `targets` (`['HBonds', 'Salt_bridges', 'HCs']`): contact types to compute. Allowed: `'HBonds'`, `'Salt_bridges'`, `'HCs'`.
-  - `subject_chains` (defaults to detected polymer chains): chains analysed as the focus of contacts
-  - `surrounding_chains` (defaults to all detected chains): chains considered as candidate partners
-  - `d_a_dist` (`4.5` Å): donor–acceptor distance cutoff for H-bonds
-  - `angle` (`150` °): donor–H–acceptor angle cutoff for H-bonds
-  - `sb_cutoff` (`3.5` Å): salt-bridge atom-pair distance cutoff
-  - `hc_cutoff` (`5.5` Å): hydrophobic-cluster centre-of-mass distance cutoff
-
-Workflow:
-
-1. Reassembles a flat per-atom interactors table in memory by joining the three files written by `interactors` (`found_topologies/<variant>.csv`, `residue_index.csv`, `atom_index_map.csv`). The legacy `whole_topology_interactors.csv` is no longer used.
-2. Writes a corrected-topology PDB (`<name>_correct.pdb`) with `Resindex` stamped as `resid` and atom IDs aligned with the `atom_index` map. This is the topology used by all subsequent MDAnalysis operations.
-3. Splits frames across `nc` worker processes.
-4. For each chain combination and each target contact type, dispatches workers. Each worker streams its frame chunk and writes partial CSVs `<name>_upto_<lastframe>.csv`. H-bond workers use an adaptive batch size that grows until RAM hits `ram_thresh`, then freezes at the largest fitting size.
-5. Merges partial CSVs per chain combination into `<name>_merged.csv`.
-6. Aggregates merged CSVs into per-residue-pair contact-frequency tables: `Hbonds_final.csv`, `SB_final.csv`, `HC_final.csv` (columns: `res_1, res_2, n_frames_contact, mean_dist, chain_1, chain_2, label_1, label_2`).
-7. Builds adjacency matrices (`<inttype>_adjacency.dat`, `combined_adjacency.dat`) where entry `[i, j]` is the persistency in % of the contact between residues `i` and `j`.
-8. Runs persistency-threshold analysis on every non-empty subset of the requested interaction types: scans `p_min` from 0 to 100 in `step` increments, builds the largest connected component at each cutoff, and writes elbow + degree-distribution CSVs and plots. Used to choose the contact-frequency threshold for downstream PSN construction.
-
-Output layout under `<general_outpath>/Contacts/`:
+### Output layout
 
 ```
-Contacts/
+<outpath>/Adjacency/
 ├── <name>_correct.pdb
-├── named/                       (or q/, depending on interactors_type)
-│   ├── H_bonds/
-│   │   ├── *_upto_*.csv         (partial, per-worker)
-│   │   └── *_merged.csv
+├── named/                         (and/or q/, per --interactors-type)
 │   ├── Salt_bridges/
-│   └── HCs/
-├── Hbonds_final.csv
-├── SB_final.csv
-├── HC_final.csv
-├── *_adjacency.dat
-├── combined_adjacency.dat
-├── adjacency_labels.dat
-├── csvs/
-│   ├── <subset>_persistency_elbow.csv
-│   └── <subset>_degree_distribution.csv
-└── plots/
-    ├── <subset>_persistency_elbow.png
-    └── <subset>_degree_distribution.png
+│   │   ├── *_upto_*.csv           (partial, per-worker)
+│   │   ├── *_merged.csv           (merged per chain-pair)
+│   │   └── *_sb_energy.csv        (per-frame energy stream)
+│   ├── H_bonds/   ( … *_Hbonds_energy.csv )
+│   ├── HCs/       ( … *_HC_energy.csv )
+│   ├── adjacency_labels.dat
+│   ├── SB_final.csv, Hbonds_final.csv, HC_final.csv
+│   ├── {SB,Hbonds,HC}_adjacency.dat        (persistency %)
+│   ├── combined_adjacency.dat
+│   ├── {SB,Hbonds,HC}_{LJ,Coulomb,total}_energy.dat
+│   ├── all_total_energy.dat                (element-wise sum across types)
+│   ├── graph_report/        (persistency elbow + degree CSVs/plots)
+│   └── energy_graph_report/ (energy strength elbow + distributions)
 ```
+
+
+## `network`
+
+Builds residue-interaction graphs from the contacts output and renders PyMOL
+sessions. Reads `<outpath>/Adjacency/` and `<outpath>/Interactors/`, writes
+`<outpath>/Network/`. Standalone — run after `contacts`.
+
+### Key options
+
+| Flag | Default | Meaning 
+|---|---|---
+| `--interactors-type` | `q`, `named` | Adjacency sub-folders to consume. Repeatable.
+| `--target` | `HBonds`, `Salt_bridges`, `HCs` | Contact types contributing to the graph. Repeatable.
+| `--edge-weight-source` | `persistency`, `energy` | Build one network per source. Repeatable. |
+| `--energy-use-abs / --no-energy-use-abs` | off | Energy → weight: `\|E\|` vs attractive-only `max(0, -E)`. |
+| `--node-metric` | `betweenness_centrality` | Centrality driving CA-sphere scaling. Repeatable. |
+| `--community` | `louvain` | Community algorithm. `louvain`, `greedy_modularity`, `label_propagation`, `connected_components`. Repeatable. |
+| `--min-frequency` | 0.0 | Drop edges with summed weight at or below this. |
+| `--min-degree` | 0 | Drop nodes below this degree. |
+| `--sphere-scale` | 2.0 | Max CA-sphere vdw radius (Å). |
+| `--stick-scale` | 0.5 | Max edge dash radius (Å). |
+| `--write-graphml / --no-write-graphml` | off | Also write one GraphML per static graph. |
+| `--shortest-paths / --no-shortest-paths` | off | All-pairs weighted shortest paths per graph. |
+| `--window-size` | — | If set, also build per-window energy networks and track community evolution. |
+| `--window-stride` | = window-size | Step between windows (non-overlapping by default). |
+| `--frame-start` / `--frame-stop` | — | Restrict to `[start, stop)`. **When set, static networks are re-aggregated from the per-frame energy CSVs over that range** instead of the pre-aggregated matrices.
+
+### Edge weights
+
+- **persistency** — from `{SB,Hbonds,HC}_adjacency.dat`, summed across the
+  requested targets (contact frequency).
+- **energy** — from `{SB,Hbonds,HC}_total_energy.dat`. Signed energy is mapped
+  to a non-negative weight: attractive-only `max(0, -E)` by default, or `|E|`
+  with `--energy-use-abs`.
+
+One graph is built per `(interactors_type × edge_weight_source)`.
+
+### Static vs time-resolved
+
+- **Static (default)** — uses the pre-aggregated contact matrices (fast).
+- **Time-resolved (`--window-size N`)** — reads the per-frame energy CSVs,
+  aggregates into windows of `N` frames, builds one graph per window, runs
+  community detection on each, and writes
+  `community_evolution_<inttype>_<source>_<method>.csv`
+  (`window_start, resindex, label, community` — pivot externally for a
+  community-vs-time heatmap).
+- **Frame range** — `--frame-start` / `--frame-stop` apply to both paths. When
+  set, the static graphs are rebuilt from the per-frame CSVs restricted to the
+  range (energy = mean per frame over the window; persistency = unique frames
+  per pair / frames in range), so they honour the sub-trajectory.
+
+### PyMOL rendering
+
+One `.pml` per `(interactors_type × source × node_metric × community)`. Each
+script loads the reference structure as a translucent cartoon, draws one CA
+sphere per residue scaled by the node metric and coloured by community, and one
+dashed edge per interaction scaled by weight (intra-community edges take the
+community colour, cross-community edges are grey). Residue selectors use the PDB
+residue numbering from the topology, so multi-chain offsets and non-contiguous
+numbering are handled correctly.
+
+### Output layout
+
+```
+<outpath>/Network/
+├── nodes_<inttype>_<source>_<method>.csv     (centrality + community per node)
+├── edges_<inttype>_<source>.csv
+├── network_<inttype>_<source>_<metric>_<method>.pml
+├── network_<inttype>_<source>.graphml         (with --write-graphml)
+├── shortest_paths_<inttype>_<source>.csv      (with --shortest-paths)
+└── community_evolution_<inttype>_<source>_<method>.csv   (with --window-size)
+```
+
+## Notes
+### `na_values`
+
+Every `pandas.read_csv` in the package shares a default NA-string list. `"NA"`
+is deliberately **excluded** so sodium atoms/residues named `NA` are not parsed
+as missing values.
+
+### Cutoffs
+
+Defaults are tuned for the systems myPSNs was developed against (CHARMM36,
+protein + lipids + ions). The salt-bridge default (3.5 Å) is tighter than the
+common 4.0–4.5 Å heavy-atom criterion; raise `--sb-cutoff` to 4.5 to match
+PyInteraph-style definitions. Hydrophobic clusters use a 5.5 Å CoM cutoff.
+
+### Ions and elements
+
+MDAnalysis guesses elements from atom names, which mis-assigns some ions
+(e.g. calcium "CAL" → carbon). The corrected-topology step handles chain/segid
+alignment; if you add ions, double-check their element assignment .
+
+## Open issues
+
+- **Water parsing** from the forcefield can return inconsistent duplicate rows.
+  Workaround: water is matched against a bundled exact-match table
+  (`mypsns/resources/sol.csv`) at startup.
+- **`q_interactors`** is less validated than `named_interactors`. For HC
+  classification it uses a `min_bonds_to_polar` / `min_bonds_to_charged` BFS
+  rule; `min_bonds_to_polar=1` is needed mainly so ALA's Cβ is classified as HC.
+  Verify HC labels on a representative system if they look off.
+- **Repulsive interactions** are excluded from energy-weighted networks by
+  default (attractive-only). Use `--energy-use-abs` to include them.
+
