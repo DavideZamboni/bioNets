@@ -600,6 +600,7 @@ def detect_communities(
     G:       nx.Graph,
     method:  str = 'louvain',
     seed:    int = 42,
+    min_members: int = 2,
 ) -> Tuple[pd.DataFrame, int]:
     '''
     Detect communities in the residue-interaction graph.
@@ -622,18 +623,27 @@ def detect_communities(
     - G:      graph from build_graph (isolated nodes are handled gracefully)
     - method: algorithm name (see above)
     - seed:   random seed for stochastic methods
+    - min_members: communities with fewer than this many nodes are dissolved;
+              their nodes get community = -1 ("solitary", unclustered) and the
+              surviving communities are renumbered 0..k-1. Default 2 drops
+              singleton communities. Set to 1 (or 0) to keep every community.
 
     Returns (community_df, n_communities) where community_df has columns:
-        resindex, label, chain, resname, community (integer ≥ 0)
+        resindex, label, chain, resname, community (integer; -1 = solitary).
+        n_communities counts only surviving communities (excludes -1).
     '''
     if G.number_of_edges() == 0:
-        logging.warning('detect_communities: graph has no edges – all nodes in community 0')
+        # no edges → every node is solitary; with min_members>1 none survive
+        comm = 0 if (min_members or 0) <= 1 else -1
+        logging.warning('detect_communities: graph has no edges – '
+                        '%s', 'all nodes in community 0' if comm == 0
+                        else 'all nodes solitary (community -1)')
         rows = [
             {'resindex': n, 'label': d.get('label', ''), 'chain': d.get('chain', ''),
-             'resname': d.get('resname', ''), 'community': 0}
+             'resname': d.get('resname', ''), 'community': comm}
             for n, d in G.nodes(data=True)
         ]
-        return pd.DataFrame(rows), 1
+        return pd.DataFrame(rows), (1 if comm == 0 else 0)
 
     method = method.lower()
 
@@ -663,6 +673,21 @@ def detect_communities(
         for node in community_set:
             node_to_community[node] = ci
 
+    # Dissolve communities smaller than min_members → -1 (solitary) and
+    # renumber the survivors to a contiguous 0..k-1 range.
+    if min_members and min_members > 1:
+        from collections import Counter
+        sizes = Counter(node_to_community.values())
+        survivors = sorted(c for c, n in sizes.items() if n >= min_members)
+        remap = {c: i for i, c in enumerate(survivors)}
+        node_to_community = {n: remap.get(c, -1)
+                             for n, c in node_to_community.items()}
+        n_dissolved = sum(1 for n in sizes.values() if n < min_members)
+        if n_dissolved:
+            logging.info('detect_communities (%s): dissolved %d communit%s with '
+                         '< %d members → solitary (-1)', method, n_dissolved,
+                         'y' if n_dissolved == 1 else 'ies', min_members)
+
     rows = []
     for node, data in G.nodes(data=True):
         rows.append({
@@ -674,7 +699,7 @@ def detect_communities(
         })
 
     df = pd.DataFrame(rows).sort_values(['community', 'resindex']).reset_index(drop=True)
-    n_communities = df['community'].nunique()
+    n_communities = int(df.loc[df['community'] >= 0, 'community'].nunique())
     logging.info(
         f'detect_communities ({method}): {n_communities} communities detected'
     )
@@ -1115,24 +1140,30 @@ def write_pymol_communities(
     lines.append('# ── network communities (spheres coloured by %s) ──' % community_method)
     base_radius = 0.3 + 0.5 * sphere_scale     # uniform, mid-sized
     n_nodes = 0
+    rendered: set = set()
     for resix in G.nodes():
         if int(resix) not in placed:
             continue
-        colour = _colour(comm_by_res.get(int(resix), 0))
+        cid = comm_by_res.get(int(resix), -1)
+        if cid < 0:                       # solitary / dissolved community → skip
+            continue
+        colour = _colour(cid)
         pt = _point_name(resix)
         obj = f'node_{resix}'
         lines.append(f'create {obj}, {pt}')
         lines.append(f'show spheres, {obj}')
         lines.append(f'set sphere_scale, {base_radius:.3f}, {obj}')
         lines.append(f'color {colour}, {obj}')
+        rendered.add(int(resix))
         n_nodes += 1
     lines.append('')
 
-    edge_lines, n_edges = _pml_edges(G, placed, stick_scale)
+    # only draw edges between rendered (clustered) nodes
+    edge_lines, n_edges = _pml_edges(G, rendered, stick_scale)
     lines += edge_lines
     lines += _pml_footer()
 
     out.write_text('\n'.join(lines) + '\n')
-    logging.info('write_pymol_communities: %s (%d nodes, %d edges, community=%s)',
+    logging.info('write_pymol_communities: %s (%d clustered nodes, %d edges, community=%s)',
                  out.name, n_nodes, n_edges, community_method)
     return out

@@ -438,6 +438,7 @@ class Network:
         self,
         community_methods: Optional[List[str]] = None,
         community_seed:    int                  = 42,
+        community_min_members: int              = 2,
     ) -> None:
         """Centrality + community detection, per static graph."""
         if not self.graphs:
@@ -457,7 +458,10 @@ class Network:
             makedirs(csv_dir, exist_ok=True)
 
             for method in community_methods:
-                cdf, n_comm = detect_communities(G, method=method, seed=community_seed)
+                cdf, n_comm = detect_communities(
+                    G, method=method, seed=community_seed,
+                    min_members=community_min_members,
+                )
                 self.community_dfs[key][method] = cdf
                 log.info('  %s/%s: %s → %d communities',
                          inttype, source, method, n_comm)
@@ -675,6 +679,7 @@ class Network:
         community_methods: Optional[List[str]] = None,
         community_seed:    int                  = 42,
         min_window_edges:  int                  = 0,
+        community_min_members: int              = 2,
     ) -> Dict[Tuple[str, str, str], Path]:
         """
         Detect communities on every windowed graph and write a tidy CSV per
@@ -708,7 +713,8 @@ class Network:
                     if G.number_of_edges() < min_window_edges:
                         continue
                     cdf, n_comm = detect_communities(
-                        G, method=method, seed=community_seed
+                        G, method=method, seed=community_seed,
+                        min_members=community_min_members,
                     )
                     log.debug('  %s/%s window=%d (%s): %d communities',
                               inttype, source, ws, method, n_comm)

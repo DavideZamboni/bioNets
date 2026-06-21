@@ -115,6 +115,11 @@ def network(
         help="Seed for stochastic community algorithms.",
         rich_help_panel=PANEL_METRICS,
     ),
+    community_min_members: Optional[int] = typer.Option(
+        None, "--community-min-members",
+        help="Minimum community size to keep (default 2; 1 keeps singletons).",
+        rich_help_panel=PANEL_METRICS,
+    ),
     min_persistency: Optional[float] = typer.Option(
         None, "--min-persistency",
         help="Drop persistency edges with summed weight \u2264 this (percent, 0..100).",
@@ -198,6 +203,7 @@ def network(
         "node_metrics":        node_metrics,
         "community_methods":   community_methods,
         "community_seed":      community_seed,
+        "community_min_members": community_min_members,
         "min_persistency":     min_persistency,
         "min_energy":          min_energy,
         "min_degree":          min_degree,
@@ -324,6 +330,7 @@ def network(
             net.run_analysis(
                 community_methods = cfg.network.community_methods,
                 community_seed    = cfg.network.community_seed,
+                community_min_members = cfg.network.community_min_members,
             )
 
             written_pml = net.write_pymol(
@@ -357,6 +364,7 @@ def network(
                 written_evolution = net.track_communities_over_time(
                     community_methods = cfg.network.community_methods,
                     community_seed    = cfg.network.community_seed,
+                    community_min_members = cfg.network.community_min_members,
                 )
 
     except Exception as e:

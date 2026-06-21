@@ -189,6 +189,8 @@ def interactors(
                 max_num_heavy_ats=cfg.interactors.max_num_heavy_ats,
                 min_bonds_to_charged=cfg.interactors.min_bonds_to_charged,
                 min_bonds_to_polar=cfg.interactors.min_bonds_to_polar,
+                named_rules=cfg.interactors.named_interactors_rules,
+                min_residue_charge=cfg.interactors.min_residue_charge,
             )
     except Exception as e:
         log.exception("interactors failed")

@@ -206,6 +206,24 @@ class Contacts:
             + "\n".join(f"  {c[0]:^7} | {' '.join(c[1:])}" for c in combos)
         )
 
+        # ── Forcefield masses for HC center-of-mass ───────────────────────────
+        # Keyed by (Resindex, atom_name); the interactors table is assembled from
+        # Interactors/found_topologies/*.csv, so its 'mass' column carries the
+        # forcefield masses. core_hc applies these to the Universe so HC COMs are
+        # forcefield-weighted (as PyInteraph does) rather than element-guessed.
+        if {'Resindex', 'atom_name', 'mass'}.issubset(self.inters.columns):
+            _m = self.inters.dropna(subset=['Resindex', 'atom_name', 'mass'])
+            self.defaults['hc_atom_masses'] = {
+                (int(r), str(a)): float(m)
+                for r, a, m in zip(_m['Resindex'], _m['atom_name'], _m['mass'])
+            }
+            log.info('Loaded %d forcefield atom masses for HC COM',
+                     len(self.defaults['hc_atom_masses']))
+        else:
+            self.defaults['hc_atom_masses'] = None
+            log.warning('No mass column in interactors table – HC COM will use '
+                        'MDAnalysis-guessed masses')
+
         # ── Per interaction-type loop ─────────────────────────────────────────
         for inttype in self.defaults["interactors_type"]:
             if inttype not in self.inters.columns:
@@ -306,7 +324,7 @@ class Contacts:
             f"{datetime.datetime.now().strftime('%I:%M%p on %B %d, %Y')}\n"
         )
 
-        def_foldernames = [i.split('_')[0] for i in self.defaults['interactors_type']]
+        def_foldernames = list(self.defaults['interactors_type'])
         inters_done = [f for f in self.outp.iterdir() if f.is_dir() and f.name in def_foldernames]
 
         if len(inters_done) == 0:
@@ -389,7 +407,7 @@ class Contacts:
             ff_dir, comb_rule=self.defaults.get('comb_rule', 2), na_values=self.nas
         )
 
-        def_foldernames = [i.split('_')[0] for i in self.defaults['interactors_type']]
+        def_foldernames = list(self.defaults['interactors_type'])
         inters_done = [f for f in self.outp.iterdir()
                        if f.is_dir() and f.name in def_foldernames]
         if not inters_done:
@@ -417,7 +435,7 @@ class Contacts:
 
             if hc_files:
                 inttype = next((t for t in self.defaults['interactors_type']
-                                if t.split('_')[0] == intfolder.name), None)
+                                if t == intfolder.name), None)
                 if inttype is None:
                     log.warning("HC energy: can't resolve interactors_type for %s – skip HC",
                                 intfolder.name)

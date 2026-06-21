@@ -38,6 +38,21 @@ from mypsns.utils.matrix_utilities import write_matrix, build_label_map, build_c
 log = logging.getLogger(__name__)
 
 
+def canonical_resname(variant_id: str) -> str:
+    """
+    Recover the real residue name from an Interactors ``variant_id``.
+
+    Interactors names residue chemistries ``<resname>`` for the first variant
+    and ``<resname>_<n>`` (n = 2, 3, …) for subsequent ones (e.g. SER, SER_2,
+    SER_3). The canonical residue name is the variant_id with a trailing
+    ``_<digits>`` removed. This is the name the MD structure uses for ALL atoms
+    of the residue — unlike the per-atom ``resname`` column, which carries
+    GROMACS terminus-patch names (NH3+, COO-) on a few atoms and therefore must
+    NOT be used to build MDAnalysis selections.
+    """
+    return re.sub(r'_\d+$', '', str(variant_id))
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # INIT – checks, input loading, defaults
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -82,11 +97,19 @@ def assemble_full_interactors(
             variant_cache[vid] = pd.read_csv(vpath, header=0, index_col=False, na_values=na_values)
 
         vdf = variant_cache[vid].copy()
-        vdf['Resindex']   = int(row['Resindex'])
-        vdf['resnum']     = int(row['resnum'])
-        vdf['Chain']      = row['Chain']
-        vdf['Entity']     = row['Entity']
-        vdf['variant_id'] = vid
+        vdf['Resindex']      = int(row['Resindex'])
+        vdf['resnum']        = int(row['resnum'])
+        vdf['Chain']         = row['Chain']
+        vdf['Entity']        = row['Entity']
+        vdf['variant_id']    = vid
+        vdf['canon_resname'] = canonical_resname(vid)   # rtp/ff name, suffix-stripped
+        # Input-topology resname (e.g. HIS) — the name the structure/PDB uses,
+        # and the correct basis for selections. Falls back to the canonical
+        # rtp name when residue_index.csv predates this column or is blank.
+        tr = ''
+        if 'topology_resname' in res_idx.columns:
+            tr = str(row['topology_resname']) if pd.notna(row['topology_resname']) else ''
+        vdf['topology_resname'] = tr if tr and tr.lower() != 'nan' else canonical_resname(vid)
         chunks.append(vdf)
 
     if not chunks:
@@ -269,10 +292,10 @@ def init_defaults(poly_chains: List[str], found_chains: List[str], log_queue: mp
         targets           = ['HBonds', 'Salt_bridges', 'HCs'], # , ],#
         subject_chains    = poly_chains,
         surrounding_chains= found_chains,
-        d_a_dist          = 4.5, # should be: a_h_dist = 3.5 NW PyInteraph2: 3
-        angle             = 150, # angle = 120 NW PyInteraph2: 150
-        sb_cutoff         = 3.5, # 4.5, at least 1 pair ()
-        hc_cutoff         = 5.5, # for GLM, POPC
+        d_a_dist          = 4.5, # donor–acceptor; PyInteraph-closest (≈ its 3.5 Å H–A)
+        angle             = 120, # D–H–A angle cutoff; PyInteraph 1 value
+        sb_cutoff         = 4.5, # PyInteraph 1 --sb-co
+        hc_cutoff         = 5.0, # PyInteraph 1 --hc-co
         log_queue         = log_queue,
         matrix_type       = ['persistency', 'energy'],
     )
@@ -288,9 +311,13 @@ def _ids_to_sel(sub_df: pd.DataFrame, chainID: str) -> Tuple[Optional[str], int]
             or (resname B and resid R3 R4 ... and name M1 M2)
             ...
         )
-    Residues sharing both their resname and the exact set of tagged atom
-    names collapse into a single clause. Assumes atom names are unique
-    within a residue (standard protein/lipid topologies).
+    Residues sharing both their resname and the exact set of tagged atom names
+    collapse into a single clause. The resname used is the input-topology name
+    (``topology_resname``, e.g. HIS — exactly what the structure/PDB uses),
+    falling back to ``canon_resname`` (the rtp name from variant_id) and then to
+    no resname clause. The per-atom ``resname`` column is never used: it carries
+    GROMACS terminus-patch names (NH3+, COO-) on a few atoms. Assumes atom names
+    are unique within a residue (standard protein/lipid topologies).
 
     Returns (selection_string, expected_atom_count). The string is None and
     the count is 0 when there are no atoms to select.
@@ -300,7 +327,14 @@ def _ids_to_sel(sub_df: pd.DataFrame, chainID: str) -> Tuple[Optional[str], int]
     sub_df = sub_df.dropna(subset=['atom_name', 'Resindex'])
     if sub_df.empty:
         return None, 0
-    has_resname = 'resname' in sub_df.columns
+    # Prefer the input-topology resname (matches the structure); then the
+    # canonical rtp name; never the per-atom resname (patch names live there).
+    if 'topology_resname' in sub_df.columns:
+        rn_col = 'topology_resname'
+    elif 'canon_resname' in sub_df.columns:
+        rn_col = 'canon_resname'
+    else:
+        rn_col = None
 
     # Group residues by (resname, frozenset of atom names)
     groups: Dict[Tuple[str, frozenset], List[int]] = {}
@@ -309,10 +343,10 @@ def _ids_to_sel(sub_df: pd.DataFrame, chainID: str) -> Tuple[Optional[str], int]
         if not names:
             continue
         rn = ''
-        if has_resname:
-            rn_series = gdf['resname'].dropna().astype(str)
+        if rn_col is not None:
+            rn_series = gdf[rn_col].dropna().astype(str)
             if not rn_series.empty:
-                rn = rn_series.iloc[0]
+                rn = rn_series.iloc[0]      # one name per residue
         groups.setdefault((rn, names), []).append(int(resindex))
 
     clauses: List[str] = []
@@ -399,17 +433,107 @@ def generate_combinations(
 # CORE – selection checker, distance evaluators, position getters, RAM guard
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def _diagnose_selection(u: mda.Universe, selection: str) -> Optional[str]:
+    """
+    Explain why a selection built by ``_ids_to_sel`` under-matches.
+
+    Parses the selection back into its (chainID, resname, resid, atom-name)
+    clauses and checks every expected (resid, name) atom against the structure,
+    classifying each shortfall as either:
+      * ``resname X`` – the atom exists but the structure calls the residue X,
+        not the name the topology uses (e.g. topology HSE vs structure HIS);
+      * ``absent``    – no atom with that chain/resid/name exists at all.
+
+    Returns a compact human-readable string, or None if nothing is missing
+    (or the selection couldn't be parsed). Purely diagnostic; never raises.
+    """
+    mchain = re.match(r'\(chainID (\S+)\)', selection)
+    chain = mchain.group(1) if mchain else None
+
+    # each clause: optional `resname <rn> and `, then `resid <ids> and name <names>`
+    clause_re = re.compile(
+        r'(?:resname (\S+) and )?resid ([\d ]+?) and name ([A-Za-z0-9 ]+?)\)'
+    )
+    expected: Dict[Tuple[int, str], Optional[str]] = {}
+    for rn, rids, nms in clause_re.findall(selection):
+        for r in rids.split():
+            for nm in nms.split():
+                expected[(int(r), nm)] = (rn or None)
+    if not expected:
+        return None
+
+    chain_sel = f'chainID {chain}' if chain else 'all'
+    try:
+        atoms = u.select_atoms(chain_sel)
+    except Exception:
+        return None
+    # (resid, name) -> set of resnames the structure uses for that atom
+    present: Dict[Tuple[int, str], set] = {}
+    for a in atoms:
+        present.setdefault((int(a.resid), str(a.name)), set()).add(str(a.resname))
+
+    absent: List[Tuple[int, str]] = []
+    mismatch: Dict[str, List[Tuple[int, str]]] = {}   # structure_resname -> [(resid,name)]
+    for (r, nm), want_rn in expected.items():
+        struct_rns = present.get((r, nm))
+        if not struct_rns:
+            absent.append((r, nm))
+        elif want_rn is not None and want_rn not in struct_rns:
+            for srn in struct_rns:
+                mismatch.setdefault(srn, []).append((r, nm))
+
+    if not absent and not mismatch:
+        return None
+
+    parts: List[str] = []
+    if mismatch:
+        for srn, pairs in sorted(mismatch.items()):
+            by_res: Dict[int, List[str]] = {}
+            for r, nm in pairs:
+                by_res.setdefault(r, []).append(nm)
+            want = sorted({expected[(r, nm)] for r, nm in pairs if expected[(r, nm)]})
+            res_str = ', '.join(f'{r} ({" ".join(sorted(v))})'
+                                for r, v in sorted(by_res.items()))
+            parts.append(
+                f'{len(pairs)} atom(s) the structure names {srn} but the '
+                f'topology calls {"/".join(want)} → resid {res_str}'
+            )
+    if absent:
+        by_res2: Dict[int, List[str]] = {}
+        for r, nm in absent:
+            by_res2.setdefault(r, []).append(nm)
+        res_str = '; '.join(f'resid {r}: {" ".join(sorted(v))}'
+                            for r, v in sorted(by_res2.items()))
+        parts.append(f'{len(absent)} atom(s) absent from the structure → {res_str}')
+    return ' | '.join(parts)
+
+
 def check_selection(u: mda.Universe, selection: str,
                     expected: Optional[int] = None) -> bool:
-    """Verify a selection returns atoms (optionally a specific count)."""
+    """Verify a selection is usable.
+
+    Returns False ONLY when the selection matches zero atoms (genuinely broken
+    — nothing to compute). A count that differs from ``expected`` is logged as a
+    warning but still returns True: the selection works, the discrepancy is
+    usually benign (resname differences between topology and structure, e.g.
+    HSE↔HIS, alternate locations, protonation differences) and must not abort
+    the whole interaction type. On a mismatch the warning names exactly which
+    atoms are missing and why (see :func:`_diagnose_selection`). The caller
+    decides what to do with a 0.
+    """
     n = len(u.select_atoms(selection))
     if n == 0:
         log.warning('Selection matched 0 atoms: %s', selection[:200])
         return False
     if expected is not None and n != expected:
-        log.warning('Selection matched %d atoms, expected %d: %s',
-                    n, expected, selection[:200])
-        return False
+        detail = _diagnose_selection(u, selection)
+        if detail:
+            log.warning('Selection matched %d atoms, expected %d (proceeding). %s',
+                        n, expected, detail)
+        else:
+            log.warning('Selection matched %d atoms, expected %d (proceeding); '
+                        'could not pinpoint missing atoms (possible duplicate '
+                        'names or altlocs): %s', n, expected, selection[:160])
     return True
 
 def split_frames(u: mda.Universe, **kwargs) -> List[List[int]]:
@@ -707,6 +831,36 @@ def core_hb(
     log.info(f'HB worker done: frames {frames[0]}–{frames[-1]}')
     return 'H-bonds', frames[0], frames[-1]
 
+def _apply_ff_masses(u: mda.Universe,
+                     mass_map: Dict[Tuple[int, str], float]) -> int:
+    """Overwrite the Universe's per-atom masses with forcefield masses from the
+    interactors table, keyed by (Resindex, atom_name) == (resid, name) — the
+    corrected PDB stamps Resindex as resid, so this matches per atom. Atoms not
+    found in the map keep their existing (MDAnalysis-guessed) mass. This makes
+    ``center_of_mass()`` weight by forcefield masses (as PyInteraph does via its
+    ff_masses files) rather than element guesses. Returns the number of masses
+    replaced. Never raises on a missing masses attribute.
+    """
+    n = len(u.atoms)
+    try:
+        new = np.array(u.atoms.masses, dtype=float)
+    except Exception:
+        new = np.ones(n, dtype=float)
+    resids = u.atoms.resids
+    names  = u.atoms.names
+    n_set = 0
+    for i in range(n):
+        m = mass_map.get((int(resids[i]), str(names[i])))
+        if m is not None:
+            new[i] = m
+            n_set += 1
+    try:
+        u.atoms.masses = new
+    except Exception:
+        u.add_TopologyAttr('masses', new)
+    return n_set
+
+
 def core_hc(
     top:       Union[str, Path],
     trj:       str,
@@ -717,6 +871,7 @@ def core_hc(
     outname:   str,
     threshold: int,
     sel2_dict: Optional[Dict[str, str]],
+    mass_map:  Optional[Dict[Tuple[int, str], float]] = None,
 ) -> Tuple[str, int, int]:
     '''
     Worker: compute hydrophobic-cluster distances for a subset of frames.
@@ -729,10 +884,20 @@ def core_hc(
         all-vs-all CoM distances within sel_dict.
     For interchain:
         sel_dict CoMs  vs  sel2_dict CoMs.
+
+    When ``mass_map`` is given ({(Resindex, atom_name): mass}, from the
+    interactors found_topologies CSVs), the Universe's masses are overwritten
+    with those forcefield masses so each side-chain ``center_of_mass()`` is
+    forcefield-weighted (matching PyInteraph) instead of using MDAnalysis's
+    element-guessed masses.
     '''
     log.info(f'HC worker: frames {frames[0]}–{frames[-1]}')
  
     u = mda.Universe(str(top), trj)
+
+    if mass_map:
+        n_set = _apply_ff_masses(u, mass_map)
+        log.debug('HC worker: applied %d forcefield masses', n_set)
  
     # ── Pre-select atom groups once ──────────────────────────────────────────
     groups1: Dict[str, mda.AtomGroup] = {}
@@ -1103,6 +1268,7 @@ def hydrophobics(
     nc           = int(defaults['nc'])
     log_queue    = defaults['log_queue']
     combos       = defaults['chain_combinations']
+    mass_map     = defaults.get('hc_atom_masses')   # {(Resindex,atom_name):mass}
     outnames: List[str] = []
 
     log.info(f'hydrophobics: cutoff={cutoff} Å\n')
@@ -1138,7 +1304,8 @@ def hydrophobics(
         fname = f'{c1}_intrachain_HC'
         outnames.append(fname)
         allargs = [
-            (top, trj, mf, sel_1_hc_str, cutoff, outpath, fname, ram_thr, None, 'hc')
+            (top, trj, mf, sel_1_hc_str, cutoff, outpath, fname, ram_thr, None,
+             mass_map, 'hc')
             for mf in frames
         ]
 
@@ -1181,7 +1348,7 @@ def hydrophobics(
             outnames.append(fname)
             allargs = [
                 (top, trj, mf, sel_1_hc_str, cutoff, outpath, fname,
-                 ram_thr, sel_2_hc_str, 'hc')
+                 ram_thr, sel_2_hc_str, mass_map, 'hc')
                 for mf in frames
             ]
             pool = mp.Pool(processes=nc, initializer=worker_init, initargs=(log_queue,))
@@ -1219,7 +1386,7 @@ def merge_results(
     for outname in outnames:
         partials = [
             f for f in all_files
-            if f.name.startswith(outname) and '_upto_' in f.name and not f.name.endswith('merged.csv')
+            if f.name.startswith(outname) and not f.name.endswith('merged.csv')
         ]
         partials.sort(key=lambda x: int(x.stem.split('_')[-1]))
 

@@ -1,19 +1,37 @@
 import numpy as np
 import pandas as pd
-true_vs_computed = {
+# Rec
+'''true_vs_computed = {
     'HBonds':[
-        '/home/davide/storage/lab_dati/risultati_rec/hb-graph_1micros.dat', 
-        '/home/davide/storage/lab_dati/psns_out/cli_outs/rec_grk1/Adjacency/named/Hbonds_adjacency.dat'
+        '/home/davide/storage/lab_dati/risultati_paragone/rec/hb-graph_1micros.dat', 
+        '/home/davide/storage/lab_dati/psns_out/cli_outs/rec_grk1/Adjacency/named_interactors/Hbonds_adjacency.dat'
               ],
     'HC':[
-        '/home/davide/storage/lab_dati/risultati_rec/hc-graph_1micros.dat', 
-        '/home/davide/storage/lab_dati/psns_out/cli_outs/rec_grk1/Adjacency/named/HC_adjacency.dat'
+        '/home/davide/storage/lab_dati/risultati_paragone/rec/hc-graph_1micros.dat', 
+        '/home/davide/storage/lab_dati/psns_out/cli_outs/rec_grk1/Adjacency/named_interactors/HC_adjacency.dat'
               ],
     'SB':[
-        '/home/davide/storage/lab_dati/risultati_rec/sb-graph_1micros.dat', 
-        '/home/davide/storage/lab_dati/psns_out/cli_outs/rec_grk1/Adjacency/named/SB_adjacency.dat'
+        '/home/davide/storage/lab_dati/risultati_paragone/rec/sb-graph_1micros.dat', 
+        '/home/davide/storage/lab_dati/psns_out/cli_outs/rec_grk1/Adjacency/named_interactors/SB_adjacency.dat'
               ]
 }
+'''
+# Pyinteraph 1
+true_vs_computed = {
+    'HBonds':[
+        '/home/davide/storage/lab_dati/risultati_paragone/pyinter_test/hb-graph.dat', 
+        '/home/davide/storage/lab_dati/psns_out/cli_outs/pyinteraph_testcase/Adjacency/named_interactors/Hbonds_adjacency.dat'
+              ],
+    'HC':[
+        '/home/davide/storage/lab_dati/risultati_paragone/pyinter_test/hc-graph.dat', 
+        '/home/davide/storage/lab_dati/psns_out/cli_outs/pyinteraph_testcase/Adjacency/named_interactors/HC_adjacency.dat'
+              ],
+    'SB':[
+        '/home/davide/storage/lab_dati/risultati_paragone/pyinter_test/sb-graph.dat', 
+        '/home/davide/storage/lab_dati/psns_out/cli_outs/pyinteraph_testcase/Adjacency/named_interactors/SB_adjacency.dat'
+              ]
+}
+
 
 sele_rows   = []   # one of (truth, computed) is zero, other not
 params_rows = []   # both non-zero, but values differ
@@ -86,7 +104,7 @@ for inttype, (truth_p, comp_p) in true_vs_computed.items():
     print(f'  computed: min={computed.min():.4g}  max={computed.max():.4g}  mean(>0)={computed[computed>0].mean():.4g}')
 
     print(f'{inttype}: {len(rows)} differing entries - {len(same_rows)} similar entries')
-    print(f'True total: {true_tot}, coomputed total: {computed_tot} observed difference abs(computed - true): {diff}\n% difference: {(diff / true_tot) * 100}')
+    print(f'True total: {true_tot}, computed total: {computed_tot} observed difference abs(computed - true): {diff}\n% difference: {(diff / true_tot) * 100}')
 
 
 pd.DataFrame(sele_rows,

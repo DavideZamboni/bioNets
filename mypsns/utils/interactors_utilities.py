@@ -37,13 +37,105 @@ import pandas as pd
 from os import makedirs
 from pathlib import Path
 from typing import Dict, List, Literal, Optional, Set, Tuple, Union
+import copy
 import networkx as nx
 import MDAnalysis as mda
 import logging
 
 log = logging.getLogger(__name__)
- 
- 
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Named-interactor (PyInteraph-style) role definitions
+# ═══════════════════════════════════════════════════════════════════════════════
+# Each role maps to a list of RULES. A rule is a dict {attribute: values}; all
+# conditions in one dict are AND-combined, and the rules in a role are OR-combined
+# (an atom matches the role if it satisfies ANY rule). A condition key prefixed
+# with "not " negates it. Values may be a list or a single string. This is the
+# YAML-native form recorded in run_config.yaml and overridable from config; it is
+# converted to the internal (attr, values) grammar by `_rules_from_config`.
+#
+# Example (resname-scoped donor): {"resname": ["CYS"], "atom_name": ["SG"]}
+NAMED_INTERACTOR_DEFAULTS: Dict[str, list] = {
+    # Hydrophobic side chains (PyInteraph hc_reslist); side-chain atoms only.
+    # Uses PyInteraph's EXACT exclusion set: backbone + AMBER amide H + the
+    # nter/cter oxygens it lists. The CHARMM amide HN is deliberately NOT
+    # excluded — PyInteraph includes it in the side-chain COM (it only drops
+    # 'H'), and matching that is what brings HC to ~0.1% vs PyInteraph. Met SD /
+    # Trp NE1 also stay in the COM (HC tag no longer stripped, see below).
+    "HC": [
+        {
+            "resname": ["ALA", "VAL", "LEU", "ILE", "PHE", "PRO", "TRP", "MET"],
+            "not atom_name": ["N", "CA", "C", "O", "H", "H1", "H2", "H3",
+                              "O1", "O2", "OXT"],
+        },
+    ],
+    # hydrogen_bonds.ini DONORS
+    "HDon": [
+        {"atom_name": ["OH", "OG", "NE2", "OG1", "NE", "N", "ND1", "NZ",
+                       "NH1", "NH2", "OW", "ND2", "SG", "OH2", "NE1"]},
+    ],
+    # hydrogen_bonds.ini ACCEPTORS
+    "HAcc": [
+        {"atom_name": ["OH", "OG", "OD1", "OD2", "OG1", "O", "ND1", "NE2",
+                       "OE2", "OW", "SG", "OE1", "OH2", "SD"]},
+    ],
+    # charged_groups.ini POSITIVE groups (*p). His is included but only acts as
+    # basic when protonated — enforced by the net-charge gate (min_residue_charge),
+    # so neutral His does not form salt bridges.
+    "Basic": [
+        {"resname": ["NH3+", "GLY-NH3+", "NHT3+", "PRO-NH2+"],
+         "atom_name": ["N", "H1", "H2", "H3", "HT1", "HT2", "HT3"]},
+        {"resname": ["ARG"],
+         "atom_name": ["CD", "NE", "CZ", "NH1", "HH11", "HH12",
+                       "NH2", "HH21", "HH22"]},
+        {"resname": ["HIS", "HSD", "HSE", "HSP", "HSA", "HSB",
+                     "HIS1", "HISH", "HID", "HIE", "HIP"],
+         "atom_name": ["CG", "ND1", "HD1", "CD2", "CE1", "NE2", "HE2"]},
+        {"resname": ["LYS", "LYSH"],
+         "atom_name": ["CE", "NZ", "HZ1", "HZ2", "HZ3"]},
+    ],
+    # charged_groups.ini NEGATIVE groups (*n) + C-terminus (all oxygen variants)
+    "Acidic": [
+        {"resname": ["ASP"], "atom_name": ["CG", "OD1", "OD2"]},
+        {"resname": ["GLU"], "atom_name": ["CD", "OE1", "OE2"]},
+        {"resname": ["COO-"],
+         "atom_name": ["C", "O1", "O2", "O", "OXT", "OT1", "OT2"]},
+    ],
+    # mass(es) (rounded) of H atoms bound to a donor that count toward HBond
+    "hb_masses": [1],
+}
+
+# Roles evaluated as selection rules (everything except the scalar hb_masses).
+NAMED_INTERACTOR_ROLES: List[str] = ["HC", "HDon", "HAcc", "Basic", "Acidic"]
+
+
+def _rules_from_config(role_rules: list) -> List[list]:
+    """Convert a role's config rules (list of ``{attribute: values}`` dicts) into
+    the internal grammar `apply_rule` expects: a list of rules, each a list of
+    ``(attribute, values)`` tuples (AND-combined). Tolerates rules already given
+    in tuple/list grammar (e.g. from code) so both forms work."""
+    out: List[list] = []
+    for rule in role_rules:
+        if isinstance(rule, dict):
+            conds = [(str(k), (v if isinstance(v, list) else [v]))
+                     for k, v in rule.items()]
+            if conds:
+                out.append(conds)
+        elif isinstance(rule, (list, tuple)):
+            # already grammar: a single (attr, vals) or a list of them
+            if rule and isinstance(rule[0], str):
+                out.append([(rule[0], rule[1])])           # (attr, vals)
+            else:
+                conds = []
+                for cond in rule:
+                    if isinstance(cond, (list, tuple)) and len(cond) == 2:
+                        conds.append((cond[0], cond[1]))
+                if conds:
+                    out.append(conds)
+    return out
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Low-level chargegroup helpers
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -535,6 +627,7 @@ def build_residue_variants(
     mychains:   Dict[str, Tuple[int, int, bool]],
     universe:   mda.Universe,
     outpath:    Path,
+    topology_resname_map: Optional[Dict[int, str]] = None,
 ) -> None:
     """
     Per-residue reconstruction → deduplication → write three normalised tables.
@@ -546,9 +639,18 @@ def build_residue_variants(
     3. Adjust ter chargegroups via adjust_ters on terminal polymer residues.
     4. Iterate residues; group by hash of intrinsic columns; first time a
        hash is seen, save its rows to found_topologies/<variant_id>.csv.
-    5. Write residue_index.csv (one row per residue) and atom_index_map.csv
-       (one row per atom in the trajectory).
+    5. Write residue_index.csv (one row per residue, including the input-topology
+       resname for selection building) and atom_index_map.csv (one row per atom).
+
+    Parameters
+    ----------
+    topology_resname_map:
+        ``{Resindex: input-topology resname}`` (e.g. HIS), written to
+        residue_index.csv as ``topology_resname``. This is the name the
+        structure/PDB uses and the correct basis for MDAnalysis selections,
+        unlike variant_id which carries the rtp/forcefield name (e.g. HSE).
     """
+    topology_resname_map = topology_resname_map or {}
     found_dir = outpath / 'found_topologies'
     makedirs(found_dir, exist_ok=True)
 
@@ -625,11 +727,12 @@ def build_residue_variants(
                   for res in universe.residues}
 
     res_idx = pd.DataFrame([{
-        'Resindex':   int(r),
-        'resnum':     resnum_map.get(int(r), int(r)),
-        'Chain':      chain_map[r],
-        'Entity':     entity_map[r],
-        'variant_id': res_to_variant[r],
+        'Resindex':         int(r),
+        'resnum':           resnum_map.get(int(r), int(r)),
+        'Chain':            chain_map[r],
+        'Entity':           entity_map[r],
+        'variant_id':       res_to_variant[r],
+        'topology_resname': topology_resname_map.get(int(r), ''),
     } for r in allres])
     res_idx.to_csv(outpath / 'residue_index.csv', header=True, index=False)
     log.debug('residue_index.csv written (%s residues)', res_idx.shape[0])
@@ -648,7 +751,17 @@ def build_residue_variants(
     log.debug('atom_index_map.csv written (%s atoms)', aim.shape[0])
 
 def get_resid_to_top(resid_df: pd.DataFrame, outpath: Path) -> pd.DataFrame:
-    data = {'Resindex':[], 'topology':[]}
+    """Map every Resindex to its forcefield topology file and to the residue
+    name as found in the INPUT topology (``resname`` column of
+    complete_residue_topologies.csv).
+
+    The input-topology resname (e.g. HIS) is what the structure/PDB actually
+    uses, unlike the rtp/forcefield name baked into variant_id (e.g. HSE), so it
+    is the correct name to build MDAnalysis selections from. Returned columns:
+    ``['Resindex', 'topology', 'topology_resname']``.
+    """
+    has_resname = 'resname' in resid_df.columns
+    data = {'Resindex': [], 'topology': [], 'topology_resname': []}
     for ix, row in resid_df.iterrows():
         ix_file = outpath / 'resid_topologies' / row['rixs']
         with open(ix_file, 'r') as f:
@@ -656,6 +769,7 @@ def get_resid_to_top(resid_df: pd.DataFrame, outpath: Path) -> pd.DataFrame:
             for myix in resixs:
                 data['Resindex'].append(myix)
                 data['topology'].append(row['ff_atoms'])
+                data['topology_resname'].append(str(row['resname']) if has_resname else '')
     return pd.DataFrame.from_dict(data)
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1231,11 +1345,23 @@ def add_hbonds(
 # Name-based interaction-type assignment helpers
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def apply_rule(rule: List[Tuple[str, str]], inttype: str, df: pd.DataFrame) -> pd.DataFrame:
+def apply_rule(rule: List[Tuple[str, str]], inttype: str, df: pd.DataFrame,
+               resid_net_charge: Optional[pd.Series] = None,
+               charge_sign: int = 0, charge_thr: float = 0.0) -> pd.DataFrame:
+    """Tag atoms matching ``rule`` with ``inttype``.
+
+    If ``charge_sign`` is non-zero, the match is additionally gated by the net
+    charge of the atom's residue (``resid_net_charge``, a per-atom Series of the
+    residue's summed partial charge): only atoms whose residue carries net charge
+    of the requested sign and magnitude are tagged. ``charge_sign=+1`` keeps
+    residues with net charge > +``charge_thr`` (basic); ``charge_sign=-1`` keeps
+    residues with net charge < -``charge_thr`` (acidic). This makes the
+    salt-bridge roles protonation-state aware (neutral His ≈ 0 → not basic;
+    protonated His ≈ +1 → basic) regardless of resname.
+    """
     seldf = df.copy()
     log.debug('apply_rule: %s -> %s', rule, inttype)
     for r in rule:
-        #print(r)
         attr = r[0]
         vals = r[1]
         if isinstance(vals, str):
@@ -1245,6 +1371,14 @@ def apply_rule(rule: List[Tuple[str, str]], inttype: str, df: pd.DataFrame) -> p
             seldf = seldf[~seldf[attr[4:]].isin(vals)]
         else:
             seldf = seldf[seldf[attr].isin(vals)]
+
+    if charge_sign and resid_net_charge is not None:
+        gate = resid_net_charge.reindex(seldf.index)
+        if charge_sign > 0:
+            seldf = seldf[gate > charge_thr]
+        else:
+            seldf = seldf[gate < -charge_thr]
+
     df, seldf = df.align(seldf, axis=1)
     df.loc[seldf.index, 'named_interactors'] += f' {inttype}'
     log.debug('apply_rule: matched %s atoms for %s', seldf.shape[0], inttype)
@@ -1296,17 +1430,15 @@ def fill_hydrogen_selections(
     if new_hbond_indices:
         new_hbond_indices = list(set(new_hbond_indices))
         for ix in new_hbond_indices:
-            curr_inter = top_df.at[ix, 'named_interactors']
+            # Tag as an HBond hydrogen but KEEP any HC tag: a donor-bound H such
+            # as the backbone amide HN, or Trp HE1, is both an HBond hydrogen and
+            # part of the hydrophobic side-chain COM in PyInteraph. Stripping HC
+            # here removed HN from every hydrophobic residue and shifted every
+            # side-chain COM (~11% HC error vs PyInteraph). Each contact type
+            # uses its own tag, so carrying both is correct.
+            top_df.at[ix, 'named_interactors'] = top_df.at[ix, 'named_interactors'] + ' HBond'
 
-            if ' HC' in curr_inter:
-                an = top_df.at[ix, 'atom_name']
-                rn = top_df.at[ix, 'resname']
-                log.debug('fill_hydrogen_selections: H atom %s of residue %s excluded from HC (bound to donor)', an, rn)
-                curr_inter = curr_inter.replace(' HC', '')
-
-            top_df.at[ix, 'named_interactors'] = curr_inter + ' HBond'
-
-        log.debug('fill_hydrogen_selections: tagged %s H atoms as HBond', len(new_hbond_indices))
+        log.debug('fill_hydrogen_selections: tagged %s H atoms as HBond (HC tag preserved)', len(new_hbond_indices))
 
     return top_df
 
@@ -1355,13 +1487,21 @@ def reconstruct_whole_topology(
     top_df_dict = fill_bond_info(topologies, nas)
 
     resid_to_top = get_resid_to_top(resid_df, inpath)
+    # Resindex → input-topology resname (HIS, …) for building selections later
+    topology_resname_map = {}
+    if 'topology_resname' in resid_to_top.columns:
+        topology_resname_map = dict(zip(
+            resid_to_top['Resindex'].astype(int),
+            resid_to_top['topology_resname'].astype(str),
+        ))
     wholetop, allres = build_wholetop(top_df_dict, resid_to_top, nas)
 
     wholetop['bonds'] = wholetop['bonds'].fillna('')
 
     mychains, wholetop = detect_chains(wholetop, allres)
 
-    build_residue_variants(wholetop, mychains, universe, outpath)
+    build_residue_variants(wholetop, mychains, universe, outpath,
+                           topology_resname_map=topology_resname_map)
 
     tmp = wholetop.dropna(ignore_index=True)
     if wholetop.shape != tmp.shape:
@@ -1506,89 +1646,51 @@ def get_named_interactors(
     df:  Updated DataFrame.
     out: Updated log string (or ``None``).
     """
-    int_names = ['HC', 'HDon', 'HAcc', 'Basic', 'Acidic']
-    defaults: Dict[str, list] = dict(
-        HC = [[
-            ('resname',       ['ALA', 'VAL', 'LEU', 'ILE',
-                               'PHE', 'PRO', 'TRP', 'MET', 'IIL', 'GLM']),
-            ('not atom_name', ['CA', 'C', 'O', 'N', 'H', 'H1', 'H2', 'H3',
-                               'O1', 'O2', 'OXT', 'OT1', 'OT2',
-                               'O12', 'O13', 'O14', 'O11',
-                               'O21', 'O22', 'O31', 'O32',
-                               'O13A', 'O13B']),
-        ]],
-        HDon = [('atom_name', [
-            'OH', 'OG', 'NE2', 'OG1', 'NE', 'N', 'ND1', 'NZ',
-            'NH1', 'NH2', 'OW', 'ND2', 'SG', 'OH2', 'OT2',
-        ])],
-        HAcc = [('atom_name', [
-            'OH', 'OG', 'OD1', 'OD2', 'OG1', 'O', 'ND1', 'NE2', 'OE2',
-            'OW', 'SG', 'OE1', 'OH2', 'SD',
-            'O12', 'O13', 'O14', 'O11',
-            'O21', 'O22', 'O31', 'O32',
-            'O13A', 'O13B', 'OT1', 'OT2',
-        ])],
-        Basic = [
-            [('resname',  ['GLY-NH3+', 'NH3+', 'NHT3+', 'PRO-NH2+']),
-             ('atom_name', ['N', 'H1', 'H2', 'H3', 'HT1', 'HT2', 'HT3'])],
-            [('resname',  ['HIS', 'HSD', 'HSE', 'HSP', 'HID', 'HIE', 'HIP']),
-             ('atom_name', ['CG', 'ND1', 'HD1', 'CD2', 'CE1', 'NE2', 'HE2'])],
-            [('resname',  ['LYS']),
-             ('atom_name', ['CE', 'NZ', 'HZ1', 'HZ2', 'HZ3'])],
-            [('resname',  ['ARG']),
-             ('atom_name', ['CD', 'NE', 'CZ', 'NH1', 'HH11', 'HH12',
-                            'NH2', 'HH21', 'HH22'])],
-            [('atom_name', 'CAL')],
-            [('atom_name', 'MG')],
-        ],
-        Acidic = [
-            [('resname',  ['ASP']),
-             ('atom_name', ['CG', 'OD1', 'OD2'])],
-            [('resname',  ['GLU']),
-             ('atom_name', ['CD', 'OE1', 'OE2'])],
-            [('resname',  ['COO-']),
-             ('atom_name', ['C', 'O1', 'O2', 'O1T', 'O2T', 'OT1', 'OT2'])],
-        ],
-        hb_masses = [1],
+    # Named-role rule set. The caller passes the FULL definition via
+    # `named_rules` (a {role: [rule, ...]} dict, e.g. from config) which
+    # completely replaces the built-in defaults; when absent, the built-in
+    # defaults are used. Each role's rules are converted to the internal grammar
+    # and applied (AND within a rule, OR across a role's rules).
+    effective: Dict[str, list] = kwargs.get('named_rules') or copy.deepcopy(
+        NAMED_INTERACTOR_DEFAULTS
     )
-    defaults.update(kwargs)
 
     log.debug('Running get_named_interactors')
 
     df['named_interactors'] = ''
 
-    for inttype in int_names:
-        rules =  defaults[inttype]
+    # Per-charged-group net charge gate for the salt-bridge roles (Basic/Acidic).
+    # Atoms are gated by the summed partial charge of their (Resindex, resname)
+    # GROUP — not the whole residue. The forcefield/ter resname distinguishes a
+    # terminus patch (NH3+, COO-) from the residue body, so each charged group is
+    # gated independently: e.g. an N-terminal Asp splits into NH3+ (≈ +1 → basic)
+    # and ASP (≈ -1 → acidic) instead of cancelling to ~0. Independent of
+    # protonation/resname (neutral His ≈ 0 → not basic; protonated His ≈ +1 →
+    # basic). Threshold via `min_residue_charge` (default 0.8); ≤ 0 disables.
+    charge_thr = float(kwargs.get('min_residue_charge', 0.8) or 0.0)
+    resid_net_charge = None
+    if charge_thr > 0 and 'charge' in df.columns and 'Resindex' in df.columns:
+        group_keys = ['Resindex', 'resname'] if 'resname' in df.columns else ['Resindex']
+        resid_net_charge = df.groupby(group_keys)['charge'].transform('sum')
 
-        log.debug('named role: %s', inttype)
-        #print(inttype, rules)
-        for rule in rules:
-            if isinstance(rule, list):
-                if not rule or not isinstance(rule[0], tuple):
-                    log.debug('skipping rule: %s', rule)
-                    continue
-                myrule = rule
-            elif isinstance(rule, tuple):
-                myrule = [rule]
+    for inttype in NAMED_INTERACTOR_ROLES:
+        role_rules = effective.get(inttype, [])
+        log.debug('named role: %s (%d rule(s))', inttype, len(role_rules))
+        sign = {'Basic': 1, 'Acidic': -1}.get(inttype, 0)
+        for myrule in _rules_from_config(role_rules):
+            if sign and resid_net_charge is not None:
+                df = apply_rule(myrule, inttype, df,
+                                resid_net_charge=resid_net_charge,
+                                charge_sign=sign, charge_thr=charge_thr)
             else:
-                log.debug('skipping rule: %s', rule)
-                continue
-            df = apply_rule(myrule, inttype, df)
+                df = apply_rule(myrule, inttype, df)
 
-    # ── Strip HC tag from atoms that also got HDon/HAcc/Basic/Acidic ────
-    ni = df['named_interactors'].fillna('').astype(str)
-    has_hc = ni.str.contains(r'\bHC\b', regex=True)
-    has_other = ni.str.contains(r'\b(?:HDon|HAcc|Basic|Acidic)\b', regex=True)
-    to_strip = has_hc & has_other
-    if to_strip.any():
-        cleaned = (ni[to_strip]
-                   .str.replace(r'\bHC\b', '', regex=True)
-                   .str.replace(r'\s+', ' ', regex=True)
-                   .str.strip())
-        # restore the leading-space format apply_rule produces
-        cleaned = cleaned.where(cleaned.eq(''), ' ' + cleaned)
-        df.loc[to_strip, 'named_interactors'] = cleaned
-        log.debug('Stripped HC tag from %s atoms (also tagged HDon/HAcc/Basic/Acidic)', int(to_strip.sum()))
+    # NOTE: previously the HC tag was stripped from atoms that also got
+    # HDon/HAcc/Basic/Acidic. That removed Met SD and Trp NE1 (acceptor/donor)
+    # from the hydrophobic side-chain COM, which PyInteraph KEEPS — and it
+    # accounted for a ~5% HC discrepancy on the validation set. The whole
+    # side chain now contributes to the HC COM (an atom may carry several roles;
+    # each contact type uses its own tag), matching PyInteraph (HC ~0.1% diff).
 
-    df = fill_hydrogen_selections(df, defaults['hb_masses'])
+    df = fill_hydrogen_selections(df, effective.get('hb_masses', [1]))
     return df
