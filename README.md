@@ -35,8 +35,11 @@ finished.
 ## Setup
 
 cd <proj_root>/myPSN
+
 conda env create -f environment.yml
+
 conda activate mypsns
+
 pip install -e .
 
 This installs the mypsns console script. Verify with:
