@@ -1,10 +1,10 @@
 # myPSNs CLI
 
-A production-grade command-line interface for the **myPSNs** pipeline, built on **Typer + Rich + Pydantic + PyYAML**.
+The command-line interface for the **myPSNs** pipeline, built on **Typer + Rich + Pydantic + PyYAML**.
+
+This file covers how the CLI is structured and why. Flags, defaults and output layouts live in the top-level `README.md`, which is the user-facing reference.
 
 ## Directory layout
-
-The files in this drop-in are designed to live inside the existing `mypsns/` package:
 
 ```
 mypsns/
@@ -20,20 +20,24 @@ mypsns/
 │   ├── interactors_cmd.py
 │   ├── contacts_cmd.py
 │   ├── validate_cmd.py
-│   └── report_cmd.py
-├── services/                       ← existing pipeline modules (untouched)
+│   ├── report_cmd.py
+│   ├── guess_ff_path_cmd.py
+│   └── network_cmd.py
+├── services/                       ← stage logic (one class per stage)
 │   ├── ff_reader.py
 │   ├── topology_recognition.py
 │   ├── interactors.py
-│   └── contacts.py
-└── utils/
+│   ├── contacts.py
+│   ├── network.py
+│   └── guess_ff_path.py
+└── utils/                          ← per-stage helper functions
 ```
 
-Plus, alongside the package:
+Plus, at the repository root:
 
 ```
-example_config.yaml                 ← sample YAML config (drop in your repo's docs/ or examples/)
-pyproject_snippet.toml              ← entry-point + dependency snippet for pyproject.toml
+example_config.yaml                 ← sample YAML config for the pipeline stages
+example_network_config.yaml         ← sample YAML config for `network`
 ```
 
 ## Architecture at a glance
@@ -42,10 +46,10 @@ The CLI is layered so that each concern owns exactly one file.
 
 **`cli.py`** is the Typer app. It owns nothing but registration:
 - global options (`--verbose`, `--quiet`, `--log-file`, `--version`)
-- subcommand wiring (`run`, `ff-reader`, `topology`, `interactors`, `contacts`, `validate`, `report`)
+- subcommand wiring (`run`, `ff-reader`, `topology`, `interactors`, `contacts`, `validate`, `report`, `guess_ff`, `network`)
 - a single entry point `main()` for the `mypsns` console script
 
-**`config.py`** is the source of truth for parameters. Every stage has a Pydantic model (`FFReaderConfig`, `TopologyConfig`, `InteractorsConfig`, `ContactsConfig`); `PipelineConfig` composes them. Values flow through three layers, lowest to highest priority:
+**`config.py`** is the source of truth for parameters. Every stage has a Pydantic model (`FFReaderConfig`, `TopologyConfig`, `InteractorsConfig`, `ContactsConfig`, `NetworkConfig`); `PipelineConfig` composes them. Values flow through three layers, lowest to highest priority:
 1. Pydantic field defaults
 2. YAML file (`--config`)
 3. CLI option overrides
@@ -87,13 +91,14 @@ CLI overrides on top of a config (e.g. bump worker count for a fat node):
 mypsns run --config config.yaml --nc 32 --target HBonds --target Salt_bridges
 ```
 
-Individual stages:
+Individual stages (`network` is never part of `run`; it always runs on its own after `contacts`):
 
 ```bash
 mypsns ff-reader   --forcefield amber99sb.ff --outpath results/
 mypsns topology    --topology protein.pdb --forcefield amber99sb.ff --outpath results/
 mypsns interactors --topology protein.pdb --outpath results/
 mypsns contacts    --topology protein.pdb --trajectory traj.xtc --outpath results/ --nc 16
+mypsns network     --outpath results/ --config network.yaml
 ```
 
 Pre-flight check (no calculations):
@@ -133,7 +138,7 @@ mypsns -q run --config config.yaml       # only WARNING+
 
 ## YAML config format
 
-See `example_config.yaml`. Top-level keys (`topology`, `trajectory`, `forcefield`, `outpath`, `log_file`) sit at the root; everything else nests under stage keys (`ff_reader:`, `topology_recognition:`, `interactors:`, `contacts:`). Unknown keys produce a hard error (`extra="forbid"` on every Pydantic model) so config drift is caught immediately.
+See `example_config.yaml`. Top-level keys (`topology`, `trajectory`, `forcefield`, `outpath`, `log_file`) sit at the root; everything else nests under stage keys (`ff_reader:`, `topology_recognition:`, `interactors:`, `contacts:`, `network:`). Unknown keys produce a hard error (`extra="forbid"` on every Pydantic model) so config drift is caught immediately.
 
 ## Design rationale
 
@@ -143,7 +148,7 @@ See `example_config.yaml`. Top-level keys (`topology`, `trajectory`, `forcefield
 
 **Why one file per subcommand?** Adding a new stage means adding one module and one `app.command()` line in `cli.py`. No god-file to navigate. Shared logic stays in `_helpers.py`; the command files contain only their own Typer option declarations and the call into the underlying service.
 
-**Resume/overwrite semantics**: each stage has a canonical "completion marker" file (e.g. `Contacts/Hbonds_final.csv`). `--resume` skips a stage iff its marker exists; `--overwrite` forces re-execution regardless. Default behaviour is "skip with warning if marker exists" — protects against accidental overwrites of long runs.
+**Resume/overwrite semantics**: each stage has a canonical completion marker, a file or folder its output leaves behind. `--resume` skips a stage iff its marker exists; `--overwrite` forces re-execution regardless. Default behaviour is "skip with warning if marker exists" — protects against accidental overwrites of long runs.
 
 **HPC friendliness**: every run dumps `run_config.yaml` to `<outpath>/`. Pair with `--log-file` and you get a reproducible artefact you can ship between machines. The `run` command also logs environment info (Python version, OS, machine arch, timestamp) before any work starts.
 
@@ -152,7 +157,7 @@ See `example_config.yaml`. Top-level keys (`topology`, `trajectory`, `forcefield
 ## Adding a new subcommand
 
 1. Create `mypsns/commands/<new>_cmd.py` with a single function whose parameters are `typer.Option(...)` calls.
-2. Re-export it from `mypsns/commands/__init__.py`.
+2. Import it in `mypsns/commands/__init__.py` and add it to `__all__`.
 3. Register it in `cli.py`:
 
    ```python
@@ -169,15 +174,6 @@ That's it — no parser plumbing, no manual help-text wrangling.
 
 The validation, YAML loading, override merging, and `--help` formatting come for free.
 
-## Service module assumptions
+## Service layer
 
-The CLI wraps the existing service classes with these expected signatures:
-
-| Service | Class | Method calls |
-|---|---|---|
-| ff_reader.py | `FFReader(inpath, outpath, na_values, nonbonded_name, additional_residues)` | `.run()` |
-| topology_recognition.py | `Topology_recognition(topology, outpath, ff_path, na_values, outlog)` | `.get_restypes(verbose=…)`, `.get_ff_parameters(verbose=…, maxToCheck=…)` |
-| interactors.py | `Interactors(topology, general_outpath, na_values, outlog)` | `.get_complete_topology(verbose=…)`, `.add_inttypes(verbose=…, **kwargs)` |
-| contacts.py | `Contacts(topology, trajectory, general_outpath)` | `.run(**kwargs)` |
-
-The existing `Topology_recognition` and `Interactors` classes already match this. The CLI assumes `FFReader` and `Contacts` expose `.run()` orchestrator methods; if your current modules differ, the only change needed is in the `try: from ..services.X import Y` block of the corresponding `*_cmd.py` and the call site. The CLI itself stays untouched.
+Commands call the service classes in `mypsns/services/` (`FFReader`, `Topology_recognition`, `Interactors`, `Contacts`, `Network`, …). Each command's `*_cmd.py` is the only place that knows both the Typer flags and the service signature, so a service signature change means editing that one call site. Read the service's `__init__` and `run` for the current arguments rather than relying on a table here, which would go stale again.

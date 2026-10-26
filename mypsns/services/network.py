@@ -48,8 +48,10 @@ import pandas as pd
 
 from mypsns.utils.matrix_utilities import (
     build_chain_map, build_label_map,
-    load_combined_per_type, load_per_frame_energy,
-    matrix_to_pairs, strength_to_percentage, window_per_frame,
+    binarize_by_threshold, energy_transform, graph_to_matrix,
+    load_combined_per_type, load_per_frame_energy, load_per_type_matrix,
+    matrix_to_pairs, pairs_to_matrix, strength_to_percentage,
+    write_labels, write_matrix, window_per_frame,
 )
 from mypsns.utils.network_utilities import (
     build_resindex_to_pdb_map,
@@ -91,6 +93,32 @@ def _threshold_for_source(
     if source == 'energy':
         return min_energy
     return 0.0
+
+
+def _resolve_weightings(weighting: str) -> List[str]:
+    """Expand a weighting choice into the list of edge modes to build.
+
+    'weighted'   → weighted edges only (edge weight = the value)
+    'unweighted' → binary edges only   (edge weight = 1 above threshold)
+    'both'       → build both (default)
+    """
+    w = (weighting or 'both').lower()
+    if w == 'both':
+        return ['weighted', 'unweighted']
+    if w in ('weighted', 'unweighted'):
+        return [w]
+    raise ValueError(
+        f"weighting must be 'weighted', 'unweighted', or 'both' — got {weighting!r}")
+
+
+def _source_label(source: str, mode: str) -> str:
+    """Graph/output label for a (source, mode) pair.
+
+    Weighted keeps the bare source name (backward-compatible file names);
+    unweighted gets an explicit suffix. Both variants therefore coexist under
+    distinct keys/files when weighting='both'.
+    """
+    return source if mode == 'weighted' else f'{source}_unweighted'
 
 
 def _build_graph_from_pairs(
@@ -164,6 +192,11 @@ class Network:
         self.centrality_dfs: Dict[Tuple[str, str], pd.DataFrame]    = {}
         self.community_dfs:  Dict[Tuple[str, str],
                                   Dict[str, pd.DataFrame]]          = {}
+        # pre-threshold matrices captured during load_static, so write_matrices()
+        # can dump the combined and per-target contributions alongside the final
+        # (thresholded) network matrix. {(inttype, source): {'combined': ndarray,
+        # 'per_target': {target: ndarray, ...}}}.
+        self._source_matrices: Dict[Tuple[str, str], Dict[str, object]] = {}
         # time-resolved
         self.windowed_graphs: Dict[Tuple[str, str, int], nx.Graph]  = {}
 
@@ -261,21 +294,32 @@ class Network:
         energy_use_abs:      bool  = False,
         min_persistency:     float = 0.0,
         min_energy:          float = 0.0,
+        weighting:           str   = 'both',
         frame_start:         Optional[int] = None,
         frame_stop:          Optional[int] = None,
     ) -> None:
         """
-        For each (inttype × source), build a graph stored at
-        ``self.graphs[(inttype, source)]``.
+        For each (inttype × source × weighting mode), build a graph stored at
+        ``self.graphs[(inttype, label)]`` where ``label`` is the source name for
+        weighted graphs and ``<source>_unweighted`` for unweighted ones.
 
         Two paths
         ---------
         * Fast (no frame range): reads the per-type matrices Contacts wrote
-          (e.g. ``SB_total_energy.dat``) and sums across ``targets``.
+          (e.g. ``SB_total_energy.dat``) and combines across ``targets``
+          (persistency by MAX/union, energy by SUM).
         * Per-frame (frame_start and/or frame_stop set): re-aggregates from
           the per-frame energy CSVs restricted to ``[frame_start, frame_stop)``.
-          Energy weight = ``sum(per-frame weight) / n_frames_eff``.
-          Persistency weight = ``Σ_target (unique_frames_per_pair / n_frames_eff)``.
+
+        Weighting
+        ---------
+        Both persistency and energy can be built weighted, unweighted, or both:
+          * weighted   — edge weight is the combined value (persistency percent,
+            or energy as "% of the strongest edge"); edges with value > the
+            threshold are kept.
+          * unweighted — edge weight is 1 wherever the combined value ≥ the
+            threshold (and > 0); this is the binary macro-IIN analogue for
+            persistency, and the same idea applied to energy strength.
 
         Parameters
         ----------
@@ -284,26 +328,28 @@ class Network:
         targets : list of {'Salt_bridges', 'HBonds', 'HCs'}
             Contact types contributing to each graph.
         edge_weight_sources : list of {'persistency', 'energy'}
-            One graph is built per source.
+            One graph (per weighting mode) is built per source.
         energy_use_abs : bool
             False (default) → attractive-only: weight = max(0, -E).
             True            → absolute:        weight = |E|.
         min_persistency : float
-            Persistency-graph edge threshold (percent, 0..100). Edges with
-            weight ≤ this are dropped.
+            Persistency-graph edge threshold (percent, 0..100). Weighted keeps
+            values > this; unweighted keeps an edge (weight 1) where value ≥ this.
         min_energy : float
             Energy-graph edge threshold (percent of the strongest edge, 0..100).
-            Energy strengths are normalised to 0..100 before thresholding, the
-            same scale the energy elbow/degree plots use. Edges with weight ≤
-            this are dropped.
+            Energy strengths are normalised to 0..100 before thresholding.
+        weighting : {'both', 'weighted', 'unweighted'}
+            Which edge weighting(s) to build for every source. Default 'both'.
         frame_start, frame_stop : int, optional
             If either is set, re-aggregate from per-frame CSVs over
             ``[frame_start, frame_stop)``.
         """
+        modes = _resolve_weightings(weighting)
+
         if frame_start is not None or frame_stop is not None:
             return self._load_static_from_per_frame(
                 interactors_type, targets, edge_weight_sources,
-                energy_use_abs, min_persistency, min_energy,
+                energy_use_abs, min_persistency, min_energy, modes,
                 frame_start, frame_stop,
             )
 
@@ -315,6 +361,9 @@ class Network:
                 log.warning('load_static: %s not found — skipped', folder)
                 continue
             for source in edge_weight_sources:
+                # combine per type: persistency by MAX (union → macro-IIN when
+                # binarised), energy by SUM of attractive weights. That rule is
+                # load_combined_per_type's default for each source.
                 mat, labels = load_combined_per_type(
                     folder, targets=targets, source=source,
                     use_abs=energy_use_abs,
@@ -325,17 +374,44 @@ class Network:
                     continue
                 # energy is normalised to 0..100 "% of strongest edge" so its
                 # threshold and edge weights are on the same scale as the energy
-                # elbow/degree plots (and as persistency).
+                # elbow/degree plots.
                 if source == 'energy':
                     mat = strength_to_percentage(mat)
-                min_value = _threshold_for_source(source, min_persistency, min_energy)
-                pairs = matrix_to_pairs(mat, labels, value_name='weight',
-                                        min_value=min_value)
-                G = _build_graph_from_pairs(pairs, self.int_top, weight_col='weight')
-                self.graphs[(inttype, source)] = G
-                log.info('  %s/%s graph: %d nodes, %d edges (min_%%=%g)',
-                         inttype, source, G.number_of_nodes(),
-                         G.number_of_edges(), min_value)
+                # capture per-target contributions (energy → attractive-only/abs
+                # weight; persistency → raw %) and the combined pre-threshold
+                # matrix, shared by both weighting modes, for write_matrices().
+                per_target: Dict[str, np.ndarray] = {}
+                for target in targets:
+                    pm = load_per_type_matrix(folder, target, source)
+                    if pm is None:
+                        continue
+                    per_target[target] = (energy_transform(pm, use_abs=energy_use_abs)
+                                          if source == 'energy' else pm)
+                threshold = _threshold_for_source(source, min_persistency, min_energy)
+
+                for mode in modes:
+                    label = _source_label(source, mode)
+                    self._source_matrices[(inttype, label)] = {
+                        'combined':   mat.copy(),
+                        'per_target': per_target,
+                    }
+                    if mode == 'unweighted':
+                        binary = binarize_by_threshold(mat, threshold)
+                        pairs  = matrix_to_pairs(binary, labels, value_name='weight',
+                                                 min_value=0.0)
+                        G = _build_graph_from_pairs(pairs, self.int_top, weight_col='weight')
+                        self.graphs[(inttype, label)] = G
+                        log.info('  %s/%s graph (unweighted, value>=%g): '
+                                 '%d nodes, %d edges', inttype, label, threshold,
+                                 G.number_of_nodes(), G.number_of_edges())
+                    else:
+                        pairs = matrix_to_pairs(mat, labels, value_name='weight',
+                                                min_value=threshold)
+                        G = _build_graph_from_pairs(pairs, self.int_top, weight_col='weight')
+                        self.graphs[(inttype, label)] = G
+                        log.info('  %s/%s graph (weighted, value>%g): '
+                                 '%d nodes, %d edges', inttype, label, threshold,
+                                 G.number_of_nodes(), G.number_of_edges())
 
         proc_time, total_time = get_endtime(start, self.start)
         log.info('load_static complete | took %s (h:m:s), total %s (h:m:s)',
@@ -351,6 +427,7 @@ class Network:
         energy_use_abs:      bool,
         min_persistency:     float,
         min_energy:          float,
+        modes:               List[str],
         frame_start:         Optional[int],
         frame_stop:          Optional[int],
     ) -> None:
@@ -410,27 +487,156 @@ class Network:
                               .nunique().reset_index(name='hit'))
                     # percent, to match the matrix-based persistency convention
                     pers['weight'] = pers['hit'] / n_frames_eff * 100.0
-                    agg = pers.groupby(['res_1', 'res_2'], as_index=False)['weight'].sum()
+                    # combine targets by MAX (union), matching the matrix path
+                    agg = pers.groupby(['res_1', 'res_2'], as_index=False)['weight'].max()
                 else:
                     log.warning('load_static (per-frame): unknown source %r — skipped',
                                 source)
                     continue
 
-                min_value = _threshold_for_source(source, min_persistency, min_energy)
-                agg = agg[agg['weight'] > min_value]
-                if agg.empty:
-                    log.warning('  %s/%s: no edges above min_%%=%g',
-                                inttype, source, min_value)
-                    continue
-                G = _build_graph_from_pairs(agg, self.int_top, weight_col='weight')
-                self.graphs[(inttype, source)] = G
-                log.info('  %s/%s graph (per-frame): %d nodes, %d edges (min_%%=%g)',
-                         inttype, source, G.number_of_nodes(),
-                         G.number_of_edges(), min_value)
+                # capture combined pre-threshold matrix for write_matrices()
+                # (per-target contributions aren't separable in the per-frame
+                # path — those files are only written from the matrix path).
+                labels_all = sorted(self.int_top['Resindex'].unique().astype(int).tolist())
+                combined_mat = pairs_to_matrix(agg, labels_all, value_col='weight')
+                threshold = _threshold_for_source(source, min_persistency, min_energy)
+
+                for mode in modes:
+                    label = _source_label(source, mode)
+                    self._source_matrices[(inttype, label)] = {
+                        'combined':   combined_mat.copy(),
+                        'per_target': {},
+                    }
+                    if mode == 'unweighted':
+                        sub = agg[(agg['weight'] >= threshold) &
+                                  (agg['weight'] > 0.0)].copy()
+                        if sub.empty:
+                            log.warning('  %s/%s: no edges with value>=%g',
+                                        inttype, label, threshold)
+                            continue
+                        sub['weight'] = 1.0
+                        G = _build_graph_from_pairs(sub, self.int_top, weight_col='weight')
+                        self.graphs[(inttype, label)] = G
+                        log.info('  %s/%s graph (per-frame, unweighted, value>=%g): '
+                                 '%d nodes, %d edges', inttype, label, threshold,
+                                 G.number_of_nodes(), G.number_of_edges())
+                    else:
+                        sub = agg[agg['weight'] > threshold]
+                        if sub.empty:
+                            log.warning('  %s/%s: no edges above value>%g',
+                                        inttype, label, threshold)
+                            continue
+                        G = _build_graph_from_pairs(sub, self.int_top, weight_col='weight')
+                        self.graphs[(inttype, label)] = G
+                        log.info('  %s/%s graph (per-frame, weighted, value>%g): '
+                                 '%d nodes, %d edges', inttype, label, threshold,
+                                 G.number_of_nodes(), G.number_of_edges())
 
         proc_time, total_time = get_endtime(start, self.start)
         log.info('load_static (per-frame) complete | took %s (h:m:s), total %s (h:m:s)',
                  proc_time, total_time)
+
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def write_matrices(
+        self,
+        subdir: str = 'matrices',
+    ) -> List[Path]:
+        """
+        Serialise every static network's adjacency matrices to ``.dat`` plus a
+        shared label list, in the exact format the Adjacency stage uses
+        (``numpy.savetxt`` whitespace-separated square matrix; ``adjacency_labels.dat``
+        as ``<resindex>\\t<Chain:resname:Resindex>`` per line).
+
+        Layout under ``Network/<inttype>/<subdir>/``::
+
+            adjacency_labels.dat                 (once per inttype)
+            <label>_network_adjacency.dat        final graph (post threshold/degree filter)
+            <label>_combined_adjacency.dat       combined-across-targets, pre-threshold
+            <label>_<target>_adjacency.dat       per-target contribution (matrix path only)
+
+        where ``<label>`` is ``<source>`` for a weighted graph and
+        ``<source>_unweighted`` for an unweighted one (so both coexist when
+        ``weighting='both'``).
+
+        Scales (documented so the numbers are unambiguous):
+          * persistency  — per-type files (``*_<target>``) carry the raw
+            per-type persistency percent (0..100); ``*_combined`` is the per-type
+            MAX (union) percent, pre-threshold. The weighted ``*_network`` keeps
+            those percents; the unweighted ``*_network`` is **binary** (1 where
+            combined persistency ≥ min_persistency) — the residue-network
+            analogue of PyInteraph's macro-IIN.
+          * energy       — ``*_combined`` and the weighted ``*_network`` are on
+            the network's 0..100 "% of the strongest edge" scale; per-target
+            ``*_<target>`` files are the pre-normalisation attractive-only /
+            absolute weight (kJ/mol). The unweighted ``*_network`` is binary
+            (1 where that strength ≥ min_energy).
+
+        The ``*_network_adjacency.dat`` matrix is reconstructed straight from the
+        built graph, so re-loading it reproduces exactly the thresholded edge set
+        the rest of the pipeline analyses. Returns the list of written paths.
+        """
+        if not self.graphs:
+            raise RuntimeError('write_matrices() called before load_static()')
+
+        start = timeit.default_timer()
+        written: List[Path] = []
+
+        # group graph keys by interactors_type so the label file is shared
+        by_inttype: Dict[str, List[Tuple[str, str]]] = {}
+        for key in self.graphs:
+            by_inttype.setdefault(key[0], []).append(key)
+
+        for inttype, keys in by_inttype.items():
+            mdir = self.out / inttype / subdir
+            makedirs(mdir, exist_ok=True)
+
+            # canonical label order — identical content/format to Adjacency's
+            # adjacency_labels.dat; also the row/col order for every matrix here.
+            labels = write_labels(self.int_top, mdir / 'adjacency_labels.dat')
+            written.append(mdir / 'adjacency_labels.dat')
+
+            for key in keys:
+                _inttype, source = key
+                G = self.graphs[key]
+
+                # final (thresholded) network matrix — round-trips with the graph.
+                # (+ 0.0 normalises IEEE negative zeros so the .dat has no
+                #  confusing '-0.000000e+00' entries; values are unchanged.)
+                final_mat = graph_to_matrix(G, labels, weight_col='weight') + 0.0
+                fp = mdir / f'{source}_network_adjacency.dat'
+                write_matrix(final_mat, fp, fmt='%.6e')
+                written.append(fp)
+                nz = int(np.count_nonzero(final_mat) // 2)
+                if nz != G.number_of_edges():
+                    log.warning('  %s/%s: matrix has %d pairs but graph has %d '
+                                'edges (endpoints outside label set?)',
+                                inttype, source, nz, G.number_of_edges())
+                log.info('  %s/%s: %s (%d×%d, %d non-zero pairs)',
+                         inttype, source, fp.name, len(labels), len(labels), nz)
+
+                cap = self._source_matrices.get(key, {})
+
+                # combined-across-targets, pre-threshold
+                combined = cap.get('combined')
+                if isinstance(combined, np.ndarray) and combined.size:
+                    cp = mdir / f'{source}_combined_adjacency.dat'
+                    write_matrix(combined + 0.0, cp, fmt='%.6e')
+                    written.append(cp)
+
+                # per-target contributions (matrix path only)
+                for target, pm in cap.get('per_target', {}).items():
+                    if not (isinstance(pm, np.ndarray) and pm.size):
+                        continue
+                    pp = mdir / f'{source}_{target}_adjacency.dat'
+                    write_matrix(pm + 0.0, pp, fmt='%.6e')
+                    written.append(pp)
+
+        proc_time, total_time = get_endtime(start, self.start)
+        log.info('write_matrices: %d files across %d interactors_type(s) | '
+                 'took %s (h:m:s), total %s (h:m:s)',
+                 len(written), len(by_inttype), proc_time, total_time)
+        return written
 
     # ─────────────────────────────────────────────────────────────────────────
 

@@ -7,6 +7,8 @@ from . import (
     run_cmd,
     validate_cmd,
     report_cmd,
+    network_cmd,
+    guess_ff_path_cmd,
 )
 
 __all__ = [
@@ -17,4 +19,6 @@ __all__ = [
     "run_cmd",
     "validate_cmd",
     "report_cmd",
+    "network_cmd",
+    "guess_ff_path_cmd",
 ]

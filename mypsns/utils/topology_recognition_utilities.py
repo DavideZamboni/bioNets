@@ -518,6 +518,13 @@ def collect_results(results: dict) -> Tuple[dict, dict]:
     found_residues = {}
     best_choices = {}
     for rn in results.keys():
+        if not results[rn]:
+            # No forcefield candidate at all (no ff entry with a comparable atom
+            # set). Leave this residue out of both dicts: save_results then records
+            # it as unmatched and get_ff_parameters halts the pipeline with a clear
+            # message instead of crashing here on max() of an empty list.
+            log.warning('No forcefield candidate found for topology residue %s', rn)
+            continue
         maxScore = max([r[0] for r in results[rn]])
         topres = sorted(results[rn], key = lambda x:x[0], reverse = True)
         if maxScore == np.inf:
@@ -531,7 +538,7 @@ def collect_results(results: dict) -> Tuple[dict, dict]:
     return found_residues, best_choices
 
 
-def save_results(out : Path, found_residues: dict, best_choices: dict, nas: list) -> None:
+def save_results(out : Path, found_residues: dict, best_choices: dict, nas: list) -> Tuple[bool, list]:
     # create directory for results
     found_topologies_path = out / 'found_topologies'
     makedirs(found_topologies_path, exist_ok = True)
@@ -562,12 +569,14 @@ def save_results(out : Path, found_residues: dict, best_choices: dict, nas: list
                 list of tuples (score: int, ff_topology: pd.DataFrame)
     '''
     complete_match = True
+    unmatched: list = []   # residues with no perfect forcefield match (halts pipeline)
     for ix, row in different_residue_topologies.iterrows():
         unique_top_resname = different_residue_topologies.loc[ix, "atoms"].rstrip("_atoms.csv")
+        resname = different_residue_topologies.loc[ix, 'resname']
         if unique_top_resname in found_residues.keys():
             ff_topology_name = unique_top_resname + "_ff_atoms.csv"
             log.debug('Perfect atom-name match for residue %s (%s) -> %s',
-                      different_residue_topologies.loc[ix, 'resname'], unique_top_resname, ff_topology_name)
+                      resname, unique_top_resname, ff_topology_name)
 
             different_residue_topologies.loc[ix, "ff_atoms"] = ff_topology_name
             found_residues[unique_top_resname].to_csv(found_topologies_path / ff_topology_name, header = True, index = False)
@@ -576,16 +585,27 @@ def save_results(out : Path, found_residues: dict, best_choices: dict, nas: list
             complete_match = False
             possile_tops_str = ""
             matching_ats = best_choices[unique_top_resname][0][0]
-            unmatching_ats = best_choices[unique_top_resname][0][1].shape[0] - matching_ats
+            total_ats = best_choices[unique_top_resname][0][1].shape[0]
+            unmatching_ats = total_ats - matching_ats
             log.warning('No perfect match for residue %s (%s): %s/%s atom names matched, %s proposed alternative(s)',
-                        different_residue_topologies.loc[ix, 'resname'], unique_top_resname,
-                        matching_ats, best_choices[unique_top_resname][0][1].shape[0], unmatching_ats)
+                        resname, unique_top_resname,
+                        matching_ats, total_ats, unmatching_ats)
             for count in range(len(best_choices[unique_top_resname])):
                 ff_topology_name = unique_top_resname + f"_uncertain_atoms_{count}.csv"
                 possile_tops_str += f"{ff_topology_name} "
                 best_choices[unique_top_resname][count][1].to_csv(possible_topologies_path / ff_topology_name, header = True, index = False)
 
             different_residue_topologies.loc[ix, "possible_atoms"] = possile_tops_str
+            unmatched.append({'resname': resname, 'topology': unique_top_resname,
+                              'matched_atoms': matching_ats, 'total_atoms': total_ats})
+        else:
+            # residue neither perfectly matched nor with any proposed alternative
+            complete_match = False
+            log.warning('No forcefield candidate at all for residue %s (%s)',
+                        resname, unique_top_resname)
+            unmatched.append({'resname': resname, 'topology': unique_top_resname,
+                              'matched_atoms': None, 'total_atoms': None})
+
     if complete_match:
         oname = "complete_residue_topologies.csv"
         columns = different_residue_topologies.columns.to_list()
@@ -596,8 +616,9 @@ def save_results(out : Path, found_residues: dict, best_choices: dict, nas: list
 
     different_residue_topologies.to_csv(out / oname, header = True, columns=columns, index = False)
     log.debug('save_results: wrote %s (complete_match=%s)', oname, complete_match)
+    return complete_match, unmatched
 
-def associate_ff_params(ff: Path, out: Path, nas: list, maxToCheck: int) -> None:
+def associate_ff_params(ff: Path, out: Path, nas: list, maxToCheck: int) -> Tuple[bool, list]:
     log.info('Associating topology residues to forcefield in: %s', ff)
 
     # 1 - load unique topologies found in input topology file
@@ -659,4 +680,4 @@ def associate_ff_params(ff: Path, out: Path, nas: list, maxToCheck: int) -> None
     '''
     found_residues, best_choices = collect_results(results)
 
-    save_results(out, found_residues, best_choices, nas)
+    return save_results(out, found_residues, best_choices, nas)

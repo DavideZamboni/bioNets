@@ -5,14 +5,12 @@ import json
 import logging
 from pathlib import Path
 from typing import Optional
-
 import typer
 
 from ..logging_utils import (
     get_console, print_banner, print_error, print_info, print_kv_table,
     print_summary, print_warning,
 )
-
 
 log = logging.getLogger(__name__)
 
@@ -76,7 +74,6 @@ def report(
             "adjacency files": cn_info.get("adjacencies", []),
             "elbow CSVs":      cn_info.get("elbow_csvs", 0),
         })
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Stage-specific status collectors

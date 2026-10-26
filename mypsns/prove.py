@@ -1,7 +1,7 @@
 import numpy as np
 import pandas as pd
 # Rec
-'''true_vs_computed = {
+true_vs_computed = {
     'HBonds':[
         '/home/davide/storage/lab_dati/risultati_paragone/rec/hb-graph_1micros.dat', 
         '/home/davide/storage/lab_dati/psns_out/cli_outs/rec_grk1/Adjacency/named_interactors/Hbonds_adjacency.dat'
@@ -15,7 +15,7 @@ import pandas as pd
         '/home/davide/storage/lab_dati/psns_out/cli_outs/rec_grk1/Adjacency/named_interactors/SB_adjacency.dat'
               ]
 }
-'''
+
 # Pyinteraph 1
 true_vs_computed = {
     'HBonds':[
@@ -115,3 +115,5 @@ pd.DataFrame(params_rows,
              columns=['row', 'col', 'intertype', 'difference']
             ).to_csv( op + 'possible_params_mismatch.csv', index=False)
 
+'''
+'''

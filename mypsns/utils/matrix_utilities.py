@@ -107,6 +107,36 @@ def load_matrix(path: Path) -> np.ndarray:
     """Load whitespace-separated square matrix; pure np.loadtxt."""
     return np.loadtxt(path)
 
+def graph_to_matrix(
+    G,
+    labels:     List[int],
+    weight_col: str = 'weight',
+) -> np.ndarray:
+    """
+    Dense symmetric adjacency matrix (float) from an ``nx.Graph`` on the given
+    ``labels`` order (Resindex list, same order the Adjacency stage uses).
+
+    ``mat[i, j] = mat[j, i] = G[u][v][weight_col]`` when residues
+    ``labels[i]`` (=u) and ``labels[j]`` (=v) share an edge, else 0. Edges whose
+    endpoints are not both in ``labels`` are skipped. The diagonal stays 0.
+
+    This is the inverse of :func:`matrix_to_pairs` for the graph the Network
+    service actually built, so writing it out and re-loading it reproduces the
+    same (thresholded) edge set — matching what ``build_persistency_matrices``
+    writes for the Adjacency stage.
+    """
+    n = len(labels)
+    idx = {int(r): i for i, r in enumerate(labels)}
+    mat = np.zeros((n, n), dtype=float)
+    for u, v, data in G.edges(data=True):
+        iu, iv = idx.get(int(u)), idx.get(int(v))
+        if iu is None or iv is None or iu == iv:
+            continue
+        w = float(data.get(weight_col, 0.0))
+        mat[iu, iv] = w
+        mat[iv, iu] = w
+    return mat
+
 # ═════════════════════════════════════════════════════════════════════════════
 # Pairs ↔ matrix pivots
 # ═════════════════════════════════════════════════════════════════════════════
@@ -250,6 +280,29 @@ def strength_to_percentage(mat: np.ndarray) -> np.ndarray:
     if smax <= 0:
         return np.zeros_like(m)
     return 100.0 * m / smax
+
+
+def binarize_by_threshold(mat: np.ndarray, threshold: float) -> np.ndarray:
+    """
+    Unweighted edges: 1.0 where a value is present *and* meets the threshold,
+    0.0 elsewhere.
+
+        binary[i,j] = 1.0  if  mat[i,j] >= threshold  and  mat[i,j] > 0
+                    = 0.0  otherwise
+
+    ``mat`` is a combined per-source matrix on its own scale (persistency in
+    percent 0..100, or energy in "% of the strongest edge" 0..100). The ``> 0``
+    guard keeps ``threshold == 0`` meaningful — a value of exactly 0 is a
+    non-contact, not an edge. The diagonal is always 0. For persistency this is
+    the residue-network analogue of PyInteraph's binary macro-IIN (an edge
+    exists iff the residue pair forms the interaction at or above the cutoff);
+    for energy it is the same idea applied to the normalised strength.
+    """
+    out = np.zeros_like(mat, dtype=float)
+    keep = (mat >= threshold) & (mat > 0.0)
+    out[keep] = 1.0
+    np.fill_diagonal(out, 0.0)
+    return out
  
  
 def load_per_type_matrix(
@@ -279,14 +332,26 @@ def load_combined_per_type(
     targets:       List[str],
     source:        str,
     use_abs:       bool = False,
+    combine:       Optional[str] = None,
 ) -> Tuple[Optional[np.ndarray], List[int]]:
     """
-    Sum per-type matrices across the requested `targets` for one `source`.
- 
+    Combine per-type matrices across the requested `targets` for one `source`.
+
+    `combine` controls how the per-type matrices are merged. Left as None it
+    follows the source, so callers get the right rule without having to know it:
+      * 'max' (default for source='persistency') — element-wise maximum. An
+        edge's combined persistency is the strongest single-type value, so
+        thresholding it reproduces the union-of-per-type-edges macro-IIN, and
+        the value stays a percentage ≤ 100 (a sum could exceed it). This holds
+        for weighted and unweighted persistency alike.
+      * 'sum' (default for source='energy') — element-wise sum. Per-type
+        attractive weights add up to the total interaction strength of a pair.
+    Pass 'sum' or 'max' explicitly to override.
+
     For source='energy', each per-type matrix is first transformed by
     `energy_transform(..., use_abs)` so the result is a non-negative weight.
-    For source='persistency', matrices are added directly (entries are %).
- 
+    For source='persistency', matrices are merged directly (entries are %).
+
     Returns (matrix or None, labels). Missing per-type files are skipped with
     a warning; a None matrix means no requested target had a file present.
     """
@@ -295,16 +360,26 @@ def load_combined_per_type(
         log.warning('load_combined_per_type: %s missing', labels_path)
         return None, []
     labels = load_labels(labels_path)
+
+    if combine is None:
+        combine = 'max' if source == 'persistency' else 'sum'
+    elif combine not in ('sum', 'max'):
+        raise ValueError(f"combine must be 'sum' or 'max', got {combine!r}")
  
-    summed: Optional[np.ndarray] = None
+    out: Optional[np.ndarray] = None
     for target in targets:
         m = load_per_type_matrix(folder, target, source)
         if m is None:
             continue
         if source == 'energy':
             m = energy_transform(m, use_abs=use_abs)
-        summed = m.copy() if summed is None else summed + m
-    return summed, labels
+        if out is None:
+            out = m.copy()
+        elif combine == 'max':
+            out = np.maximum(out, m)
+        else:
+            out = out + m
+    return out, labels
 
 def load_per_frame_energy(
     folder:   Path,

@@ -16,7 +16,6 @@ from ..logging_utils import (
 
 log = logging.getLogger(__name__)
 
-
 def validate(
     config: Path = typer.Option(
         ..., "--config",

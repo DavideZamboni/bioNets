@@ -73,6 +73,14 @@ def network(
               "(weight=max(0,-E)). On: |E|, including repulsive."),
         rich_help_panel=PANEL_WEIGHT,
     ),
+    weighting: Optional[str] = typer.Option(
+        None, "--weighting",
+        help=("Edge weighting per source: 'weighted' (edge weight = value), "
+              "'unweighted' (edge weight = 1 above threshold; binary macro-IIN "
+              "analogue), or 'both' (default). 'both' suffixes the binary "
+              "variant's files/graphs with '_unweighted'."),
+        rich_help_panel=PANEL_WEIGHT,
+    ),
     window_size: Optional[int] = typer.Option(
         None, "--window-size",
         help=("Also build per-window energy networks of this many frames "
@@ -122,12 +130,14 @@ def network(
     ),
     min_persistency: Optional[float] = typer.Option(
         None, "--min-persistency",
-        help="Drop persistency edges with summed weight \u2264 this (percent, 0..100).",
+        help="Persistency edge threshold (percent, 0..100). Weighted graphs keep "
+             "edges > this; unweighted graphs keep an edge (weight 1) where \u2265 this.",
         rich_help_panel=PANEL_FILTER,
     ),
     min_energy: Optional[float] = typer.Option(
         None, "--min-energy",
-        help="Drop energy edges with weight \u2264 this (percent of strongest edge, 0..100).",
+        help="Energy edge threshold (percent of strongest edge, 0..100). Weighted "
+             "graphs keep edges > this; unweighted graphs keep an edge where \u2265 this.",
         rich_help_panel=PANEL_FILTER,
     ),
     min_degree: Optional[int] = typer.Option(
@@ -148,6 +158,12 @@ def network(
     stick_scale: Optional[float] = typer.Option(
         None, "--stick-scale",
         help="Max edge stick (dash) radius [Å].",
+        rich_help_panel=PANEL_PYMOL,
+    ),
+    write_matrices: Optional[bool] = typer.Option(
+        None, "--write-matrices/--no-write-matrices",
+        help="Also dump each network's adjacency matrices (.dat) + labels under "
+             "Network/<inttype>/matrices/ (same format as Adjacency).",
         rich_help_panel=PANEL_PYMOL,
     ),
     write_graphml: Optional[bool] = typer.Option(
@@ -196,6 +212,7 @@ def network(
         "targets":             targets,
         "edge_weight_sources": edge_weight_sources,
         "energy_use_abs":      energy_use_abs,
+        "weighting":           weighting,
         "window_size":         window_size,
         "window_stride":       window_stride,
         "frame_start":         frame_start,
@@ -210,6 +227,7 @@ def network(
         "reference_pdb":       reference_pdb,
         "sphere_scale":        sphere_scale,
         "stick_scale":         stick_scale,
+        "write_matrices":      write_matrices,
         "write_graphml":       write_graphml,
         "shortest_paths":      shortest_paths,
     }, stage_key="network")
@@ -247,6 +265,7 @@ def network(
         "targets":              cfg.network.targets,
         "edge_weight_sources":  cfg.network.edge_weight_sources,
         "energy_use_abs":       cfg.network.energy_use_abs,
+        "weighting":            cfg.network.weighting,
     })
     if cfg.network.frame_start is not None or cfg.network.frame_stop is not None:
         print_summary("Frame range", {
@@ -274,6 +293,7 @@ def network(
     print_summary("PyMOL", {
         "sphere_scale":   cfg.network.sphere_scale,
         "stick_scale":    cfg.network.stick_scale,
+        "write_matrices": cfg.network.write_matrices,
         "write_graphml":  cfg.network.write_graphml,
         "shortest_paths": cfg.network.shortest_paths,
     })
@@ -316,6 +336,7 @@ def network(
                 energy_use_abs      = cfg.network.energy_use_abs,
                 min_persistency     = cfg.network.min_persistency,
                 min_energy          = cfg.network.min_energy,
+                weighting           = cfg.network.weighting,
                 frame_start         = cfg.network.frame_start,
                 frame_stop          = cfg.network.frame_stop,
             )
@@ -326,6 +347,11 @@ def network(
                     net.graphs[key] = net.apply_filter(
                         key, min_degree=cfg.network.min_degree
                     )
+
+            # Dump adjacency matrices (.dat) + label list, mirroring Adjacency.
+            # After the degree filter so *_network_adjacency.dat matches the graph.
+            if cfg.network.write_matrices:
+                net.write_matrices()
 
             net.run_analysis(
                 community_methods = cfg.network.community_methods,

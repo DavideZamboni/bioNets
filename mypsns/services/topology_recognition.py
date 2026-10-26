@@ -1,4 +1,5 @@
 from os import path, makedirs
+import math
 import pandas as pd
 from pathlib import Path
 import os
@@ -38,6 +39,13 @@ from mypsns.utils.topology_recognition_utilities import associate_ff_params, get
 from mypsns.utils.general_utilities import get_endtime
 pd.options.mode.chained_assignment = None
 log = logging.getLogger(__name__)
+
+
+class TopologyAssociationError(RuntimeError):
+    """Raised when topology recognition cannot associate every distinct residue
+    topology in the input structure to a forcefield entry. Halts the pipeline
+    before the interactors stage (which would otherwise fail with a confusing
+    'file not found' for the unmatched residues)."""
 
 class Topology_recognition():
     def __init__(
@@ -151,8 +159,38 @@ class Topology_recognition():
         # To associate unique restypes to ff entries
         start = timeit.default_timer()
 
-        associate_ff_params(self.ff, self.out, self.nas, maxToCheck)
+        complete, unmatched = associate_ff_params(self.ff, self.out, self.nas, maxToCheck)
 
         proc_time, tot_time = get_endtime(start, self.start)
         log.info('Residue-to-forcefield association complete; get_ff_parameters took %s (h:m:s), total %s (h:m:s)',
                  proc_time, tot_time)
+
+        if not complete:
+            # Build a readable list of the residues that could not be matched.
+            lines = []
+            for u in unmatched:
+                matched, total = u.get('matched_atoms'), u.get('total_atoms')
+                is_count = (isinstance(matched, (int, float)) and total is not None
+                            and math.isfinite(matched) and matched >= 0)
+                if is_count:
+                    lines.append(
+                        f"  - {u['resname']} (topology {u['topology']}): "
+                        f"{int(matched)}/{int(total)} atom names matched the closest "
+                        f"forcefield entry")
+                else:
+                    lines.append(
+                        f"  - {u['resname']} (topology {u['topology']}): "
+                        f"no forcefield entry matched its atom names")
+            detail = "\n".join(lines)
+            msg = (
+                f"Topology recognition could not associate {len(unmatched)} residue "
+                f"topology/ies to the forcefield:\n{detail}\n"
+                f"No forcefield entry perfectly matched these atom names, so the "
+                f"per-residue topology files needed downstream were not written. "
+                f"Inspect '{(self.out / 'unmatching_residue_topologies.csv')}' and the "
+                f"proposed alternatives in '{(self.out / 'possible_topologies')}'. "
+                f"The pipeline cannot continue to the interactors stage until every "
+                f"residue topology is matched (e.g. add the missing residue(s) to the "
+                f"forcefield, or correct the input structure's atom names).")
+            log.error(msg)
+            raise TopologyAssociationError(msg)

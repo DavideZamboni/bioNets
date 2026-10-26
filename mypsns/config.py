@@ -283,6 +283,13 @@ class NetworkConfig(BaseModel):
         description=("Energy → weight transform. False: weight = max(0, -E) "
                      "(attractive only). True: weight = |E| (also repulsive)."),
     )
+    weighting: Literal["weighted", "unweighted", "both"] = Field(
+        default="both",
+        description=("Edge weighting to build for every source. 'weighted': edge "
+                     "weight = the value; 'unweighted': edge weight = 1 above the "
+                     "threshold (binary macro-IIN analogue); 'both' builds each "
+                     "(files/graphs suffixed '_unweighted' for the binary variant)."),
+    )
     # ── Time-resolved energy network (optional) ──
     window_size: Optional[int] = Field(
         default=None, ge=1,
@@ -335,11 +342,15 @@ class NetworkConfig(BaseModel):
     # An edge is kept when its weight (in %) is strictly greater than the threshold.
     min_persistency: float = Field(
         default=0.0, ge=0.0, le=100.0,
-        description="Drop persistency edges with weight ≤ this (percent, 0..100).",
+        description="Persistency edge threshold (percent, 0..100). Weighted graphs "
+                    "keep edges with combined persistency > this; unweighted graphs "
+                    "keep an edge (weight 1) where combined persistency ≥ this.",
     )
     min_energy: float = Field(
         default=0.0, ge=0.0, le=100.0,
-        description="Drop energy edges with weight ≤ this (percent of strongest edge, 0..100).",
+        description="Energy edge threshold (percent of strongest edge, 0..100). "
+                    "Weighted graphs keep edges > this; unweighted graphs keep an "
+                    "edge (weight 1) where strength ≥ this.",
     )
     min_degree: int = Field(
         default=0, ge=0,
@@ -359,6 +370,12 @@ class NetworkConfig(BaseModel):
         description="Max edge stick (dash) radius [Å] (largest edge weight).",
     )
     # ── Optional auxiliary outputs ──
+    write_matrices: bool = Field(
+        default=True,
+        description=("Also dump each network's adjacency matrices (.dat) and a "
+                     "shared adjacency_labels.dat under Network/<inttype>/matrices/, "
+                     "in the same format as the Adjacency stage."),
+    )
     write_graphml: bool = Field(
         default=False,
         description="Also write a GraphML for Gephi/Cytoscape.",
