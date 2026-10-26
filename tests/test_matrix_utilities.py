@@ -21,11 +21,11 @@ PERS = np.array([
 ])
 
 
-def test_binarize_keeps_values_at_or_above_threshold():
+def test_binarize_keeps_values_strictly_above_threshold():
+    # Strict like PyInteraph's filter_graph: 20.0 (== threshold) is dropped.
     out = binarize_by_threshold(PERS, 20.0)
     expected = np.zeros_like(PERS)
-    for i, j in [(0, 1), (0, 3)]:                  # 20.0 (== threshold) and 35.0
-        expected[i, j] = expected[j, i] = 1.0
+    expected[0, 3] = expected[3, 0] = 1.0          # 35.0
     np.testing.assert_array_equal(out, expected)
 
 
@@ -53,16 +53,19 @@ def test_binarize_returns_float_and_leaves_input_untouched():
     np.testing.assert_array_equal(PERS, before)
 
 
-def test_threshold_semantics_weighted_strict_unweighted_inclusive():
-    # The documented asymmetry: a pair exactly at the threshold is an edge of
-    # the unweighted graph (>=) but not of the weighted one (>).
+def test_threshold_semantics_weighted_and_unweighted_share_the_edge_set():
+    # Both are strict (>), so the unweighted graph is the weighted one with
+    # weight 1, and a pair exactly at the threshold is an edge of neither.
     labels = [0, 1, 2, 3]
-    weighted = matrix_to_pairs(PERS, labels, value_name='weight', min_value=20.0)
-    weighted_pairs = set(zip(weighted['res_1'], weighted['res_2']))
-    binary = binarize_by_threshold(PERS, 20.0)
-    assert (0, 1) not in weighted_pairs
-    assert binary[0, 1] == 1.0
-    assert (0, 3) in weighted_pairs and binary[0, 3] == 1.0
+    for threshold in (0.0, 10.0, 19.9, 20.0, 35.0):
+        weighted = matrix_to_pairs(PERS, labels, value_name='weight',
+                                   min_value=threshold)
+        # (no edge left → an empty frame without columns)
+        weighted_pairs = set(zip(weighted.get('res_1', []), weighted.get('res_2', [])))
+        binary = binarize_by_threshold(PERS, threshold)
+        binary_pairs = {(i, j) for i, j in zip(*np.nonzero(np.triu(binary, 1)))}
+        assert weighted_pairs == binary_pairs, threshold
+    assert binarize_by_threshold(PERS, 20.0)[0, 1] == 0.0
 
 # ═════════════════════════════════════════════════════════════════════════════
 # graph_to_matrix

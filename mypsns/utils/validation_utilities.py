@@ -4,7 +4,8 @@ validation_utilities.py — compare myPSNs residue matrices with reference graph
 
 Replaces the ad-hoc ``mypsns/prove.py``. Used by:
 - mypsns/commands/compare_cmd.py          (`mypsns compare`)
-- tests/test_pyinteraph_regression.py     (SB/HC ≤ 0.2 %, H-bonds ≤ 5 %)
+- tests/test_pyinteraph_regression.py     (runs the pipeline on the shipped
+                                            test case, tolerances of its preset)
 
 Conventions — all inherited from prove.py, so numbers and CSVs produced before
 the rewrite stay comparable (the CSVs are byte-identical):
@@ -34,7 +35,6 @@ key works when the paths are given explicitly (e.g. a macro-IIN).
 from __future__ import annotations
 
 import logging
-import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -45,7 +45,7 @@ import pandas as pd
 log = logging.getLogger(__name__)
 
 # ═════════════════════════════════════════════════════════════════════════════
-# File-name conventions and legacy datasets
+# File-name conventions and reference datasets (presets)
 # ═════════════════════════════════════════════════════════════════════════════
 
 # Type keys in the order prove.py reported them (and wrote the CSV rows).
@@ -64,37 +64,69 @@ MYPSNS_ADJACENCY_NAMES: Dict[str, str] = {
     'SB':     'SB_adjacency.dat',
 }
 
-# The two datasets prove.py compared, relative to a data root. The root is
-# $MYPSNS_VALIDATION_ROOT if set, else the lab folder they were produced in.
-VALIDATION_ROOT_ENV = 'MYPSNS_VALIDATION_ROOT'
-DEFAULT_VALIDATION_ROOT = Path('/home/davide/storage/lab_dati')
-PRESETS: Dict[str, Dict[str, str]] = {
-    # CHARMM test case shipped with PyInteraph 1 (149 residues). This is the
-    # validation quoted in CLAUDE.md and asserted by the regression test.
-    'pyinteraph_testcase': {
-        'truth_dir':    'risultati_paragone/pyinter_test',
-        'truth_suffix': '',
-        'computed_dir': 'psns_out/cli_outs/pyinteraph_testcase/Adjacency/named_interactors',
-    },
-    # Recoverin–GRK1 (219 residues), PyInteraph run on 1 µs.
-    'rec_grk1': {
-        'truth_dir':    'risultati_paragone/rec',
-        'truth_suffix': '_1micros',
-        'computed_dir': 'psns_out/cli_outs/rec_grk1/Adjacency/named_interactors',
-    },
+# Reference datasets live in the repository, under tests/data/<preset>/, so a
+# preset never depends on a machine-specific folder. They are found relative to
+# this file, i.e. in a source checkout (or an editable install); a wheel does
+# not carry tests/.
+TEST_DATA_DIR = Path(__file__).resolve().parents[2] / 'tests' / 'data'
+
+
+@dataclass(frozen=True)
+class Preset:
+    """A PyInteraph reference dataset shipped in tests/data/<name>/.
+
+    ``truth_dir`` holds the PyInteraph graphs (``{hb,hc,sb}-graph<suffix>.dat``);
+    ``config`` is the myPSNs config that reproduces them (paths are given on
+    the command line). ``max_pct_diff`` is the agreement the preset is
+    known to reach, per type: `mypsns compare --preset` fails above it unless
+    --max-pct-diff overrides that type. The computed side is always the
+    caller's run (--computed-dir).
+    """
+    truth_dir:    Path
+    truth_suffix: str
+    config:       Path
+    max_pct_diff: Dict[str, float]
+    description:  str
+
+
+PRESETS: Dict[str, Preset] = {
+    # CHARMM example shipped with PyInteraph 1 (149 residues, 151 frames),
+    # inputs included: tests/test_pyinteraph_regression.py re-runs it end to
+    # end. SB/HC sit at 0.07 % / 0.11 %, H-bonds at 3.93 % (detection engine).
+    'pyinteraph_testcase': Preset(
+        truth_dir=TEST_DATA_DIR / 'pyinteraph_testcase' / 'pyinteraph',
+        truth_suffix='',
+        config=TEST_DATA_DIR / 'pyinteraph_testcase' / 'config.yaml',
+        max_pct_diff={'SB': 0.2, 'HC': 0.2, 'HBonds': 4.2},
+        description='PyInteraph 1 CHARMM test case (149 residues)',
+    ),
+    # Recoverin–GRK1 (219 residues), 1 µs = 5 × 200 ns replicas. References are
+    # PyInteraph 1's own 2018 graphs of that run, mapped to today's residue
+    # order (see tests/data/rec_grk1/README.md). Trajectory not shipped. SB/HC
+    # reach 0.13 % / 0.20 % (PyInteraph wrote 1 decimal); H-bonds were only run
+    # on r1 (preset below), so their limit is r1's.
+    'rec_grk1': Preset(
+        truth_dir=TEST_DATA_DIR / 'rec_grk1',
+        truth_suffix='_1micros',
+        config=TEST_DATA_DIR / 'rec_grk1' / 'config.yaml',
+        max_pct_diff={'SB': 0.2, 'HC': 0.25, 'HBonds': 5.0},
+        description='recoverin–GRK1, PyInteraph 1 run of 2018 (219 residues)',
+    ),
+    # The same 2018 run, replica r1 only = frames 0–20000 of the 1 µs file:
+    # PyInteraph's own per-replica graphs, 5× less trajectory to analyse.
+    # SB 0.10 %, HC 0.13 %, H-bonds 4.28 % (every PyInteraph edge found).
+    'rec_grk1_r1': Preset(
+        truth_dir=TEST_DATA_DIR / 'rec_grk1',
+        truth_suffix='_r1',
+        config=TEST_DATA_DIR / 'rec_grk1' / 'config_r1.yaml',
+        max_pct_diff={'SB': 0.2, 'HC': 0.2, 'HBonds': 5.0},
+        description='recoverin–GRK1, 2018 PyInteraph run, replica r1 (200 ns)',
+    ),
 }
 
 # Column layout of the mismatch CSVs (unchanged from prove.py).
 SELE_COLUMNS   = ['row', 'col', 'intertype', 'present_in', 'non-0 val']
 PARAMS_COLUMNS = ['row', 'col', 'intertype', 'difference']
-
-
-def validation_root(data_root: Optional[Path] = None) -> Path:
-    """Data root for :data:`PRESETS`: explicit > $MYPSNS_VALIDATION_ROOT > default."""
-    if data_root is not None:
-        return Path(data_root)
-    env = os.environ.get(VALIDATION_ROOT_ENV)
-    return Path(env) if env else DEFAULT_VALIDATION_ROOT
 
 
 def reference_paths(
@@ -116,17 +148,17 @@ def adjacency_paths(
             for t in types if t in MYPSNS_ADJACENCY_NAMES}
 
 
-def preset_paths(
-    name:      str,
-    data_root: Optional[Path] = None,
-) -> Tuple[Dict[str, Path], Dict[str, Path]]:
-    """(truth paths, computed paths) for a legacy dataset in :data:`PRESETS`."""
+def get_preset(name: str) -> Preset:
+    """The :data:`PRESETS` entry, or ValueError naming the valid choices."""
     if name not in PRESETS:
         raise ValueError(f'unknown preset {name!r}; choose from {sorted(PRESETS)}')
-    root = validation_root(data_root)
-    p = PRESETS[name]
-    return (reference_paths(root / p['truth_dir'], p['truth_suffix']),
-            adjacency_paths(root / p['computed_dir']))
+    return PRESETS[name]
+
+
+def preset_paths(name: str) -> Dict[str, Path]:
+    """{type: reference graph} of a preset (the truth side only)."""
+    p = get_preset(name)
+    return reference_paths(p.truth_dir, p.truth_suffix)
 
 
 def read_label_names(path: Path) -> List[str]:

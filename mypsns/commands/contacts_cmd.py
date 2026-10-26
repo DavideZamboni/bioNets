@@ -9,10 +9,11 @@ import typer
 
 from ..logging_utils import (
     print_banner, print_error, print_info, print_success, print_summary,
+    print_warning,
 )
 from ._helpers import (
-    collect_overrides, dump_run_config, ensure_dir, load_or_die,
-    require_path, warn_skip,
+    collect_overrides, contacts_done, dump_run_config, ensure_dir, load_or_die,
+    require_path,
 )
 
 
@@ -103,6 +104,12 @@ def contacts(
         help="Donor-H-acceptor angle cutoff [°].",
         rich_help_panel=PANEL_CUTOFFS,
     ),
+    d_h_cutoff: Optional[float] = typer.Option(
+        None, "--d-h-cutoff",
+        help="Donor-hydrogen pairing cutoff [Å] (default 1.4: pairs Cys S-H, "
+             "like PyInteraph 1; MDAnalysis' own default 1.2 does not).",
+        rich_help_panel=PANEL_CUTOFFS,
+    ),
     sb_cutoff: Optional[float] = typer.Option(
         None, "--sb-cutoff",
         help="Salt-bridge atom-pair cutoff [Å].",
@@ -166,6 +173,7 @@ def contacts(
         "surrounding_chains": surrounding_chains,
         "d_a_dist":           d_a_dist,
         "angle":              angle,
+        "d_h_cutoff":         d_h_cutoff,
         "sb_cutoff":          sb_cutoff,
         "hc_cutoff":          hc_cutoff,
         "matrix_type":        matrix_type,
@@ -173,7 +181,9 @@ def contacts(
         "thr_step":           thr_step,
     }, stage_key="contacts")
 
-    cfg = load_or_die(config, overrides)
+    # contacts never reads the forcefield path: its masses and LJ parameters
+    # come from the parsed copy in <outpath>/forcefield/ and Interactors/
+    cfg = load_or_die(config, overrides, require_forcefield=False)
 
     require_path("topology",   cfg.topology,   must_exist=True)
     require_path("trajectory", cfg.trajectory, must_exist=True)
@@ -210,26 +220,25 @@ def contacts(
     print_summary("Cutoffs", {
         "d_a_dist":  f"{cfg.contacts.d_a_dist} Å",
         "angle":     f"{cfg.contacts.angle}°",
+        "d_h_cutoff": f"{cfg.contacts.d_h_cutoff} Å",
         "sb_cutoff": f"{cfg.contacts.sb_cutoff} Å",
         "hc_cutoff": f"{cfg.contacts.hc_cutoff} Å",
     })
 
-    print_summary("Network analysis parameters", {
-        "matrix_type":  f"{cfg.contacts.matrix_type} Å",
-        "energy_use_abs":     f"{cfg.contacts.energy_use_abs}°",
-        "thr_step": f"{cfg.contacts.thr_step} Å",
+    print_summary("Matrices", {
+        "matrix_type":    cfg.contacts.matrix_type,
+        "energy_use_abs": cfg.contacts.energy_use_abs,
+        "thr_step":       f"{cfg.contacts.thr_step} %",
     })
 
     if dry_run:
         print_info("Dry run — nothing executed.")
         raise typer.Exit()
 
-    # Resume / overwrite logic — check for the canonical final marker
-    marker = cnt_out / 'graph_report' / 'plot'   # final preliminary data output
-    if resume and marker.exists() and not overwrite:
-        print_info(f"contacts: final output found at {marker} — skipping (resume).")
-        raise typer.Exit()
-    if warn_skip(marker, "contacts", overwrite):
+    # Resume / overwrite: done when every requested scheme has its matrices
+    if contacts_done(cfg) and not overwrite:
+        print_warning(f"contacts: adjacency matrices already present in {cnt_out} "
+                      "— skipping. Use --overwrite to force.")
         raise typer.Exit()
 
     ensure_dir(cnt_out)
@@ -262,6 +271,7 @@ def contacts(
             surrounding_chains=cfg.contacts.surrounding_chains,
             d_a_dist=cfg.contacts.d_a_dist,
             angle=cfg.contacts.angle,
+            d_h_cutoff=cfg.contacts.d_h_cutoff,
             sb_cutoff=cfg.contacts.sb_cutoff,
             hc_cutoff=cfg.contacts.hc_cutoff,
             na_values=cfg.contacts.na_values,
@@ -276,5 +286,5 @@ def contacts(
         print_error(f"contacts failed: {e}")
         raise typer.Exit(code=1)
 
-    dump_run_config(cfg, cfg.outpath)
+    dump_run_config(cfg, cfg.outpath, sections=["contacts"])
     print_success(f"contacts complete → {cnt_out}")

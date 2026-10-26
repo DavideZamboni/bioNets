@@ -126,5 +126,5 @@ def ff_reader(
         print_error(f"ff-reader failed: {e}")
         raise typer.Exit(code=1)
 
-    dump_run_config(cfg, cfg.outpath)
+    dump_run_config(cfg, cfg.outpath, sections=["ff_reader"])
     print_success(f"ff-reader complete → {ff_out}")

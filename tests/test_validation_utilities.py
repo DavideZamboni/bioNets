@@ -9,7 +9,7 @@ from typer.testing import CliRunner
 
 from mypsns.cli import app
 from mypsns.utils.validation_utilities import (
-    PARAMS_COLUMNS, SELE_COLUMNS, VALIDATION_ROOT_ENV,
+    PARAMS_COLUMNS, PRESETS, SELE_COLUMNS, TEST_DATA_DIR,
     compare_files, compare_matrices, preset_paths, read_label_names,
     write_comparison_csvs,
 )
@@ -106,13 +106,21 @@ def test_write_csvs_columns_and_labels(tmp_path):
     assert sele.loc[0, 'label_row'] == 'A:ASP:3' and sele.loc[0, 'label_col'] == 'A:ALA:0'
 
 
-def test_preset_paths_use_env_root(tmp_path, monkeypatch):
-    monkeypatch.setenv(VALIDATION_ROOT_ENV, str(tmp_path))
-    truth, computed = preset_paths('rec_grk1')
-    assert truth['HBonds'] == tmp_path / 'risultati_paragone/rec/hb-graph_1micros.dat'
-    assert computed['SB'] == (tmp_path / 'psns_out/cli_outs/rec_grk1/Adjacency/'
-                              'named_interactors/SB_adjacency.dat')
-    with pytest.raises(ValueError, match='unknown preset'):
+@pytest.mark.parametrize('name', sorted(PRESETS))
+def test_presets_are_complete_and_inside_the_repo(name):
+    # Every preset ships its reference graphs and the config reproducing them
+    # under tests/data/, so no comparison depends on a machine-specific path.
+    preset = PRESETS[name]
+    truth = preset_paths(name)
+    assert set(truth) == {'HBonds', 'HC', 'SB'} == set(preset.max_pct_diff)
+    for path in [*truth.values(), preset.config]:
+        assert path.is_file(), path
+        assert TEST_DATA_DIR in path.parents
+    assert truth['HBonds'].name == f'hb-graph{preset.truth_suffix}.dat'
+
+
+def test_unknown_preset_names_the_choices():
+    with pytest.raises(ValueError, match='unknown preset.*pyinteraph_testcase'):
         preset_paths('nope')
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -154,3 +162,25 @@ def test_cli_rejects_missing_inputs(tmp_path):
         '--computed', f'X={tmp_path / "b.dat"}',
     ])
     assert result.exit_code == 2
+
+
+def test_cli_preset_needs_a_computed_run():
+    result = CliRunner().invoke(app, ['compare', '--preset', 'pyinteraph_testcase'])
+    assert result.exit_code == 2
+    assert '--computed-dir' in result.output
+
+
+def test_cli_preset_applies_its_tolerances(tmp_path):
+    # Comparing the preset's references with themselves passes; a computed
+    # matrix with a doubled SB fails on the preset's own SB limit.
+    truth = preset_paths('pyinteraph_testcase')
+    run = tmp_path / 'run'
+    run.mkdir()
+    for t, name in [('HBonds', 'Hbonds'), ('HC', 'HC'), ('SB', 'SB')]:
+        m = np.loadtxt(truth[t])
+        np.savetxt(run / f'{name}_adjacency.dat', 2 * m if t == 'SB' else m)
+    args = ['compare', '--preset', 'pyinteraph_testcase', '--computed-dir', str(run)]
+    result = CliRunner().invoke(app, args)
+    assert result.exit_code == 1, result.output
+    result = CliRunner().invoke(app, args + ['--max-pct-diff', 'SB=150'])
+    assert result.exit_code == 0, result.output

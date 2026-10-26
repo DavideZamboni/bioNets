@@ -79,8 +79,8 @@ def assemble_full_interactors(
     Returned columns mirror OLD whole_topology_interactors.csv plus
     the new resnum / variant_id columns.
     """
-    res_idx = pd.read_csv(residue_index_path, header=0, index_col=False, na_values=na_values)
-    aim     = pd.read_csv(atom_index_map_path, header=0, index_col=False, na_values=na_values)
+    res_idx = pd.read_csv(residue_index_path, header=0, index_col=False, na_values=na_values, keep_default_na=False)
+    aim     = pd.read_csv(atom_index_map_path, header=0, index_col=False, na_values=na_values, keep_default_na=False)
 
     variant_cache: Dict[str, pd.DataFrame] = {}
     chunks:        List[pd.DataFrame]      = []
@@ -94,7 +94,7 @@ def assemble_full_interactors(
                     f'Variant CSV missing: {vpath} '
                     f'(referenced by Resindex {int(row["Resindex"])})'
                 )
-            variant_cache[vid] = pd.read_csv(vpath, header=0, index_col=False, na_values=na_values)
+            variant_cache[vid] = pd.read_csv(vpath, header=0, index_col=False, na_values=na_values, keep_default_na=False)
 
         vdf = variant_cache[vid].copy()
         vdf['Resindex']      = int(row['Resindex'])
@@ -294,6 +294,7 @@ def init_defaults(poly_chains: List[str], found_chains: List[str], log_queue: mp
         surrounding_chains= found_chains,
         d_a_dist          = 4.5, # donor–acceptor; PyInteraph-closest (≈ its 3.5 Å H–A)
         angle             = 120, # D–H–A angle cutoff; PyInteraph 1 value
+        d_h_cutoff        = 1.4, # donor–H pairing; > Cys S–H (1.32 Å), see ContactsConfig
         sb_cutoff         = 4.5, # PyInteraph 1 --sb-co
         hc_cutoff         = 5.0, # PyInteraph 1 --hc-co
         log_queue         = log_queue,
@@ -724,7 +725,7 @@ def core_sb(
 
 def estimate_hb_frame_window(
     u, donors: str, acceptors: str, hydrogens: Optional[str],
-    distc: float, angc: float, nframes: int, threshold: int, nc: int,
+    distc: float, angc: float, dhc: float, nframes: int, threshold: int, nc: int,
 ) -> int:
     '''
     Estimate a per-worker HBA batch size (frames) that keeps `nc` concurrent
@@ -736,7 +737,7 @@ def estimate_hb_frame_window(
     '''
     n_traj  = len(u.trajectory)
     probe_n = max(1, min(nframes, n_traj))
-    probe   = run_batch_hba(u, donors, acceptors, hydrogens, distc, angc, 0, probe_n)
+    probe   = run_batch_hba(u, donors, acceptors, hydrogens, distc, angc, dhc, 0, probe_n)
     bytes_per_frame = max(1.0, probe.memory_usage(deep=True).sum() / probe_n)
 
     vm     = psutil.virtual_memory()
@@ -758,6 +759,7 @@ def run_batch_hba(u,
                   hydrogens,
                   distc,
                   angc,
+                  dhc,
                   start,
                   stop,                  
                   ) -> pd.DataFrame:
@@ -770,6 +772,11 @@ def run_batch_hba(u,
         hydrogens_sel      = hydrogens,
         d_a_cutoff         = distc,
         d_h_a_angle_cutoff = angc,
+        # donors_sel and hydrogens_sel are both given, so HBA pairs each donor
+        # with every hydrogen within d_h_cutoff (no topology bonds involved).
+        # Its 1.2 Å default is shorter than a Cys S–H (1.32 Å), which silently
+        # drops every thiol donor; PyInteraph 1 does find them.
+        d_h_cutoff         = dhc,
         update_selections  = True
     )
     myhbs.run(start=start, stop=stop, verbose=False)
@@ -803,6 +810,7 @@ def core_hb(
     donors:       str,
     distc:        float,
     angc:         float,
+    dhc:          float,
     outpath:      Path,
     outname:      str,
     hydrogens:    Optional[str],
@@ -813,8 +821,8 @@ def core_hb(
     (sized once in Hbonds). No per-worker RAM probing.
     '''
     log.info(f'HB worker: frames {frames[0]}–{frames[-1]} (window={frame_window})')
-    log.debug('donors=%s acceptors=%s hydrogens=%s d_a=%s angle=%s',
-              donors, acceptors, hydrogens, distc, angc)
+    log.debug('donors=%s acceptors=%s hydrogens=%s d_a=%s angle=%s d_h=%s',
+              donors, acceptors, hydrogens, distc, angc, dhc)
 
     u    = mda.Universe(top, trj)
     last = 0
@@ -824,7 +832,7 @@ def core_hb(
             break
         start, stop = batch[0], batch[-1] + 1        # run() stop is exclusive
         log.info(f'HB batch frames {batch[0]}–{batch[-1]} (window={frame_window})')
-        hb_df = run_batch_hba(u, donors, acceptors, hydrogens, distc, angc, start, stop)
+        hb_df = run_batch_hba(u, donors, acceptors, hydrogens, distc, angc, dhc, start, stop)
         hb_df.to_csv(outpath / f'{outname}_upto_{batch[-1]}.csv', header=True, index=False)
         last += len(batch)
 
@@ -1110,13 +1118,14 @@ def Hbonds(
 
     distc     = float(defaults['d_a_dist'])
     angc      = float(defaults['angle'])
+    dhc       = float(defaults['d_h_cutoff'])
     nframes   = int(defaults['nframes'])
     nc        = defaults['nc']
     log_queue = defaults['log_queue']
     combos    = defaults['chain_combinations']
     threshold = defaults['ram_thresh']
     outnames: List[str] = []
-    log.info(f'Hbonds: d_a_dist={distc} Å, angle={angc}°, nframes={nframes}\n')
+    log.info(f'Hbonds: d_a_dist={distc} Å, angle={angc}°, d_h_cutoff={dhc} Å, nframes={nframes}\n')
 
     # ── Adaptive frame window computation ──
     per_worker_window = nframes
@@ -1137,7 +1146,7 @@ def Hbonds(
     if best is not None:
         _, d, a, h, ch = best
         per_worker_window = estimate_hb_frame_window(
-            u_probe, d, a, h, distc, angc, nframes, threshold, nc)
+            u_probe, d, a, h, distc, angc, dhc, nframes, threshold, nc)
         log.info('HB per-worker frame window (probed on largest selection: '
                  'chain %s, %d donor+acceptor atoms): %d', ch, best[0], per_worker_window)
     del u_probe
@@ -1170,7 +1179,7 @@ def Hbonds(
             outnames.append(fname)
 
             allargs = [
-                (top, trj, mf, sel_1_hacc, sel_1_hdon, distc, angc,
+                (top, trj, mf, sel_1_hacc, sel_1_hdon, distc, angc, dhc,
                  outpath, fname, sel_1_hs, per_worker_window, 'hb')
                 for mf in frames
             ]
@@ -1197,7 +1206,7 @@ def Hbonds(
                 fname   = f'{c1}_HDon_{c2}_HAcc'
                 outnames.append(fname)
                 allargs = [
-                    (top, trj, mf, sel_2_hacc, sel_1_hdon, distc, angc,
+                    (top, trj, mf, sel_2_hacc, sel_1_hdon, distc, angc, dhc,
                      outpath, fname, sel_1_hs, per_worker_window, 'hb')
                     for mf in frames
                 ]
@@ -1222,7 +1231,7 @@ def Hbonds(
                 outnames.append(fname)
                 
                 allargs = [
-                    (top, trj, mf, sel_1_hacc, sel_2_hdon, distc, angc,
+                    (top, trj, mf, sel_1_hacc, sel_2_hdon, distc, angc, dhc,
                      outpath, fname, sel_2_hs, per_worker_window, 'hb')
                     for mf in frames
                 ]
@@ -1395,7 +1404,7 @@ def merge_results(
             continue
 
         merged = pd.concat(
-            [pd.read_csv(f, header=0, index_col=False, na_values=na_values) for f in partials],
+            [pd.read_csv(f, header=0, index_col=False, na_values=na_values, keep_default_na=False) for f in partials],
             ignore_index=True,
         )
 
@@ -1487,7 +1496,7 @@ def load_pair_contacts(
     # ── per-chunk pre-aggregation → small DataFrames only ────────────────
     chunks = []
     for p in csv_paths:
-        for chunk in pd.read_csv(p, header=0, index_col=False, chunksize=chunksize, na_values=na_values):
+        for chunk in pd.read_csv(p, header=0, index_col=False, chunksize=chunksize, na_values=na_values, keep_default_na=False):
             if not _SCHEMA_PAIR.issubset(chunk.columns):
                 log.warning(f'load_pair_contacts: unexpected columns in {p.name} – skipped')
                 break
@@ -1577,7 +1586,7 @@ def load_hbond_contacts(
 
     chunks = []
     for p in csv_paths:
-        for chunk in pd.read_csv(p, header=0, index_col=False, chunksize=chunksize, na_values=na_values):
+        for chunk in pd.read_csv(p, header=0, index_col=False, chunksize=chunksize, na_values=na_values, keep_default_na=False):
             if not _SCHEMA_HBOND.issubset(chunk.columns):
                 log.warning(f'load_hbond_contacts: unexpected columns in {p.name} – skipped')
                 break
@@ -1708,7 +1717,7 @@ _KE = 138.935458  # kJ*mol^-1*nm*e^-2  (GROMACS Coulomb constant, eps_r = 1)
 
 def load_lj_params(ff_dir: Path, comb_rule: int = 2, na_values=None):
     '''lj_lookup(type_i, type_j) -> combined (sigma_ij, epsilon_ij) in nm, kJ/mol.'''
-    at  = pd.read_csv(ff_dir / 'atomtypes_se.csv', na_values=na_values)
+    at  = pd.read_csv(ff_dir / 'atomtypes_se.csv', na_values=na_values, keep_default_na=False)
     sig = dict(zip(at['atom_type'].astype(str), at['sigma'].astype(float)))
     eps = dict(zip(at['atom_type'].astype(str), at['epsilon'].astype(float)))
     cache: Dict[Tuple[str, str], Tuple[float, float]] = {}
@@ -1869,7 +1878,7 @@ def get_hc_energy(
         carry_frame: Optional[int] = None
         carry_rows: List[Dict]     = []
  
-        for chunk in pd.read_csv(p, chunksize=chunksize, na_values=na_values):
+        for chunk in pd.read_csv(p, chunksize=chunksize, na_values=na_values, keep_default_na=False):
             chunk = chunk.dropna(subset=['id_1', 'id_2'])
             if chunk.empty:
                 continue
@@ -1924,9 +1933,14 @@ def build_results(
         na_values: Optional[List[str]] = ["", "#N/A", "#N/A N/A", "#NA", "-1.#IND", "-1.#QNAN", "-NaN", "-nan", "1.#IND", "1.#QNAN", "<NA>", "N/A", "NULL", "NaN", "n/a", "nan", "null"]
 ):
     log.info(f'Building results, files: {merged}')
-    hbonds = [f for f in merged if f.name.endswith('_Hbonds_merged.csv')]
-    hcs = [f for f in merged if f.name.endswith('_HC_merged.csv')]
-    sbs = [f for f in merged if f.name.endswith('_sb_merged.csv')]
+    # Classify by the folder each contact type writes to (_SUBFOLDER), not by a
+    # file-name suffix: the inter-chain H-bond files are <c1>_HDon_<c2>_HAcc /
+    # <c1>_HAcc_<c2>_HDon, without the '_Hbonds' of the intra-chain ones, and
+    # a suffix test dropped every inter-chain H-bond from Hbonds_final.csv and
+    # the adjacency matrices (the energy path, which globs the folder, kept them).
+    hbonds = [f for f in merged if f.parent.name == _SUBFOLDER['HBonds']]
+    hcs = [f for f in merged if f.parent.name == _SUBFOLDER['HCs']]
+    sbs = [f for f in merged if f.parent.name == _SUBFOLDER['Salt_bridges']]
     
     hbond_res = load_hbond_contacts(hbonds, interactors, outp, na_values=na_values)
     log.info(f'Results for Hbonds found at: {hbond_res.resolve()}')
@@ -1970,7 +1984,7 @@ def build_persistency_matrices(
         if not csv_p.exists():
             log.warning(f'build_adjacency_matrices: {csv_p} missing → skip')
             continue
-        df  = pd.read_csv(csv_p, header=0, index_col=False, na_values=na_values)
+        df  = pd.read_csv(csv_p, header=0, index_col=False, na_values=na_values, keep_default_na=False)
         mat = np.zeros((n, n), dtype=float)
 
         for _, row in df.iterrows():
@@ -1995,7 +2009,7 @@ def build_persistency_matrices(
         if not vis_p.exists():
             log.warning(f'build_adjacency_matrices: {vis_p} missing → skip union')
             continue
-        df = pd.read_csv(vis_p, header=0, index_col=False, na_values=na_values)
+        df = pd.read_csv(vis_p, header=0, index_col=False, na_values=na_values, keep_default_na=False)
         for _, row in df.iterrows():
             r1, r2 = int(row['res_1']), int(row['res_2'])
             if r1 > r2:
@@ -2068,7 +2082,7 @@ def get_interaction_energy(
             wrote_header = False
             carry: Optional[pd.DataFrame] = None     # rows whose frame may continue
  
-            for chunk in pd.read_csv(p, chunksize=chunksize, na_values=na_values):
+            for chunk in pd.read_csv(p, chunksize=chunksize, na_values=na_values, keep_default_na=False):
                 # ── decode chunk by kind ─────────────────────────────────────
                 if kind == 'SB':
                     chunk = chunk.dropna(subset=['id_1', 'id_2'])

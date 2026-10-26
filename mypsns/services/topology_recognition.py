@@ -39,7 +39,7 @@ from mypsns.utils.topology_recognition_utilities import (
     associate_ff_params, get_residue_types, parse_initial_topology_info,
     COMPLETE_TABLE, FF_ATOM_COLUMNS, UNMATCHED_TABLE,
     candidate_files, candidate_index, dangling_bonds, pair_candidate_atoms,
-    read_str_csv, read_topology_table, rename_candidate_atoms, topology_key,
+    read_str_csv, read_topology_table, topology_key, with_structure_names,
 )
 from mypsns.utils.general_utilities import get_endtime
 pd.options.mode.chained_assignment = None
@@ -146,7 +146,8 @@ class Topology_recognition():
 
         # Find all different types of residues associated with the same resname:
         restypes = pd.DataFrame.from_dict({'resname':[], 'atnames':[], 'rixs':[], 'masses':[]})
-        top_df = pd.read_csv(self.out / 'initial_topology_info.csv', header = 0, index_col = False)
+        top_df = pd.read_csv(self.out / 'initial_topology_info.csv', header = 0, index_col = False,
+                             na_values = self.nas, keep_default_na = False)
        
         restypes = get_residue_types(top_df, self.res_topology_folder)
 
@@ -306,11 +307,13 @@ def accept_topologies(
      - dry_run: check and report, but write nothing.
 
     For every choice the candidate's atoms are paired with the structure's
-    (pair_candidate_atoms) and renamed to the structure's names
-    (rename_candidate_atoms), so the stored topology joins with the structure
-    in the contacts stage. A pair that would rename an atom of a different mass
-    means the positional pairing is wrong: that choice is refused and the user
-    is asked for a hand-edited CSV instead.
+    (pair_candidate_atoms), and the structure's name of every atom is written
+    to the structure_atom_name column next to atom_name, which (like bonds)
+    keeps the forcefield's names. The interactors stage renames the atoms to
+    the structure's names (structure_named), so the topology joins with the
+    structure in the contacts stage. A pair that renames an atom of a
+    different mass means the positional pairing is wrong: that choice is
+    refused and the user is asked for a hand-edited CSV instead.
 
     Writes found_topologies/<key>_ff_atoms.csv, fills the row's ff_atoms (and
     accepted_from, the provenance) in unmatching_residue_topologies.csv, and
@@ -393,7 +396,8 @@ def accept_topologies(
 
         renamed = pairs[pairs['renamed']]
         renames = dict(zip(renamed['ff_name'], renamed['top_name']))
-        ff_atoms = rename_candidate_atoms(cand, renames)
+        # pairs has one row per candidate atom, in candidate order
+        ff_atoms = with_structure_names(cand, pairs['top_name'])
         dangling = dangling_bonds(ff_atoms)
         if dangling:
             detail = '; '.join(f'{a}: {" ".join(t)}' for a, t in dangling.items())
@@ -419,7 +423,7 @@ def accept_topologies(
         table.loc[p['ix'], 'ff_atoms'] = p['target']
         table.loc[p['ix'], 'accepted_from'] = p['source']
         log.info('accept-topology: %s <- %s%s', p['key'], p['source'],
-                 ' (renamed ' + ', '.join(f'{a}->{b}' for a, b in p['renames'].items()) + ')'
+                 ' (structure names: ' + ', '.join(f'{a}->{b}' for a, b in p['renames'].items()) + ')'
                  if p['renames'] else '')
         if not dry_run:
             p['ff_atoms'].to_csv(found_dir / p['target'], header = True, index = False)

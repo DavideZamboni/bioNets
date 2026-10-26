@@ -1,0 +1,64 @@
+# myPSNs settings that reproduce PyInteraph 1's 2018 rec_grk1 run over the whole
+# microsecond (preset `rec_grk1`, references *-graph_1micros.dat). The rules are
+# what that run used, read back from its own output tables (see README.md).
+# Every parameter that matters is pinned here, so a later change of myPSNs
+# defaults cannot silently break the reproduction.
+#
+# Trajectory not shipped. With the lab copy (paths are examples):
+#   mypsns run --config tests/data/rec_grk1/config.yaml \
+#     -t rec_grk1_nolip.pdb -x rec_grk1_1micros.xtc \
+#     -ff charmm36-apr2019_vm.ff -o <outpath>
+#   mypsns compare --preset rec_grk1 --computed-dir <outpath>/Adjacency/named_interactors
+# config_r1.yaml is the same on replica r1 only (5× faster).
+interactors:
+  modes: [named_interactors]
+  # PyInteraph's groups are name-based, with no charge check: its C-terminal
+  # group (C, OT1, OT2) matched these neutral COOH termini (net 0 e), which
+  # any positive gate would drop.
+  min_residue_charge: 0.0
+  named_interactors_rules:
+    # The default HC rule. By `residue`, so the patch atoms of the three HC
+    # termini count, as in PyInteraph: HA of the NH2 N-terminus (GRK1 Met1)
+    # and HT2 of the COOH C-termini (Leu202, GRK1 Ile16).
+    HC:
+    - residue: [ALA, VAL, LEU, ILE, PHE, PRO, TRP, MET]
+      not atom_name: [N, CA, C, O, H, H1, H2, H3, O1, O2, OXT, OT1, OT2]
+    # In 2018 the myristoyl was a residue of its own (A-2 GLM, after A-1 GLY)
+    # and its "side chain" everything outside PyInteraph's backbone names:
+    # the tail with C1, without the carbonyl O1.
+    - residue: [GLM]
+      not atom_name: [N, HN, CA, HA1, HA2, C, O, O1]
+    # PyInteraph's default hydrogen_bonds.ini
+    HDon:
+    - atom_name: [OH, OG, NE2, OG1, NE, N, ND1, NZ, NH1, NH2, OW, ND2, SG, OH2, NE1]
+    HAcc:
+    - atom_name: [OH, OG, OD1, OD2, OG1, O, ND1, NE2, OE2, OW, SG, OE1, OH2, SD]
+    # The 2018 charged groups: Lys, Ca2+ (a custom sc.cal.CALp), Asp, Glu and
+    # the C-termini. No Arg: none of its pairs is in the 2018 graphs. No His:
+    # the structure's HSE is not in PyInteraph's residue table.
+    Basic:
+    - resname: [LYS, LYSH]
+      atom_name: [CE, NZ, HZ1, HZ2, HZ3]
+    - resname: [CAL]
+      atom_name: [CAL]
+    Acidic:
+    - resname: [ASP]
+      atom_name: [CG, OD1, OD2]
+    - resname: [GLU]
+      atom_name: [CD, OE1, OE2]
+    - resname: [COOH, COO-]
+      atom_name: [C, OT1, OT2]
+    hb_masses: [1]
+
+contacts:
+  interactors_type: [named_interactors]
+  matrix_type: [persistency]
+  beg_frm: 0
+  end_frm: -1                # all 100001 frames = r1 + r2…r5 (each without frame 0)
+  sb_cutoff: 4.5             # PyInteraph default
+  # 2018 ran with --hc-co 5.5 (PyInteraph's default is 5.0): at 5.0 Å every
+  # HC persistency comes out low and the graph is ~54 % off.
+  hc_cutoff: 5.5
+  d_a_dist: 4.5
+  angle: 120.0
+  d_h_cutoff: 1.4            # pairs Cys39 SG–HG1 (S–H 1.32 Å)

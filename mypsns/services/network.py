@@ -317,9 +317,10 @@ class Network:
           * weighted   — edge weight is the combined value (persistency percent,
             or energy as "% of the strongest edge"); edges with value > the
             threshold are kept.
-          * unweighted — edge weight is 1 wherever the combined value ≥ the
+          * unweighted — edge weight is 1 wherever the combined value > the
             threshold (and > 0); this is the binary macro-IIN analogue for
-            persistency, and the same idea applied to energy strength.
+            persistency (strict, like PyInteraph's filter_graph), and the same
+            idea applied to energy strength. Same edge set as weighted.
 
         Parameters
         ----------
@@ -334,7 +335,7 @@ class Network:
             True            → absolute:        weight = |E|.
         min_persistency : float
             Persistency-graph edge threshold (percent, 0..100). Weighted keeps
-            values > this; unweighted keeps an edge (weight 1) where value ≥ this.
+            values > this; unweighted keeps an edge (weight 1) where value > this.
         min_energy : float
             Energy-graph edge threshold (percent of the strongest edge, 0..100).
             Energy strengths are normalised to 0..100 before thresholding.
@@ -401,7 +402,7 @@ class Network:
                                                  min_value=0.0)
                         G = _build_graph_from_pairs(pairs, self.int_top, weight_col='weight')
                         self.graphs[(inttype, label)] = G
-                        log.info('  %s/%s graph (unweighted, value>=%g): '
+                        log.info('  %s/%s graph (unweighted, value>%g): '
                                  '%d nodes, %d edges', inttype, label, threshold,
                                  G.number_of_nodes(), G.number_of_edges())
                     else:
@@ -508,16 +509,16 @@ class Network:
                         'per_target': {},
                     }
                     if mode == 'unweighted':
-                        sub = agg[(agg['weight'] >= threshold) &
+                        sub = agg[(agg['weight'] > threshold) &
                                   (agg['weight'] > 0.0)].copy()
                         if sub.empty:
-                            log.warning('  %s/%s: no edges with value>=%g',
+                            log.warning('  %s/%s: no edges with value>%g',
                                         inttype, label, threshold)
                             continue
                         sub['weight'] = 1.0
                         G = _build_graph_from_pairs(sub, self.int_top, weight_col='weight')
                         self.graphs[(inttype, label)] = G
-                        log.info('  %s/%s graph (per-frame, unweighted, value>=%g): '
+                        log.info('  %s/%s graph (per-frame, unweighted, value>%g): '
                                  '%d nodes, %d edges', inttype, label, threshold,
                                  G.number_of_nodes(), G.number_of_edges())
                     else:
@@ -564,13 +565,13 @@ class Network:
             per-type persistency percent (0..100); ``*_combined`` is the per-type
             MAX (union) percent, pre-threshold. The weighted ``*_network`` keeps
             those percents; the unweighted ``*_network`` is **binary** (1 where
-            combined persistency ≥ min_persistency) — the residue-network
+            combined persistency > min_persistency) — the residue-network
             analogue of PyInteraph's macro-IIN.
           * energy       — ``*_combined`` and the weighted ``*_network`` are on
             the network's 0..100 "% of the strongest edge" scale; per-target
             ``*_<target>`` files are the pre-normalisation attractive-only /
             absolute weight (kJ/mol). The unweighted ``*_network`` is binary
-            (1 where that strength ≥ min_energy).
+            (1 where that strength > min_energy).
 
         The ``*_network_adjacency.dat`` matrix is reconstructed straight from the
         built graph, so re-loading it reproduces exactly the thresholded edge set

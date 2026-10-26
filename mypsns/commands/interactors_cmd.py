@@ -58,9 +58,20 @@ def interactors(
         help="Min H charge for HBond participation.",
         rich_help_panel=PANEL_HBOND,
     ),
+    DA_masses: Optional[List[int]] = typer.Option(
+        None, "--da-masses",
+        help="Rounded mass of a donor/acceptor element (q_interactors). "
+             "Repeat for several; replaces the default 14 16 19 (N, O, F).",
+        rich_help_panel=PANEL_HBOND,
+    ),
     min_abs_charge: Optional[float] = typer.Option(
         None, "--min-abs-charge",
         help="Min |local charge| for Acidic/Basic classification.",
+        rich_help_panel=PANEL_SB,
+    ),
+    min_residue_charge: Optional[float] = typer.Option(
+        None, "--min-residue-charge",
+        help="Net-charge gate (e) for named_interactors Basic/Acidic groups. 0 disables.",
         rich_help_panel=PANEL_SB,
     ),
     max_abs_charge: Optional[float] = typer.Option(
@@ -71,6 +82,11 @@ def interactors(
     max_num_heavy_ats: Optional[int] = typer.Option(
         None, "--max-num-heavy-ats",
         help="Max heavy atoms per HC sub-cluster.",
+        rich_help_panel=PANEL_HC,
+    ),
+    min_num_heavy_ats: Optional[int] = typer.Option(
+        None, "--min-num-heavy-ats",
+        help="Min heavy atoms per HC sub-cluster (soft bound of the split).",
         rich_help_panel=PANEL_HC,
     ),
     min_bonds_to_charged: Optional[int] = typer.Option(
@@ -112,14 +128,18 @@ def interactors(
         "modes":                 modes,
         "max_DA_charge":         max_DA_charge,
         "min_H_charge":          min_H_charge,
+        "DA_masses":             DA_masses,
         "min_abs_charge":        min_abs_charge,
+        "min_residue_charge":    min_residue_charge,
         "max_abs_charge":        max_abs_charge,
         "max_num_heavy_ats":     max_num_heavy_ats,
+        "min_num_heavy_ats":     min_num_heavy_ats,
         "min_bonds_to_charged":  min_bonds_to_charged,
         "min_bonds_to_polar":    min_bonds_to_polar,
     }, stage_key="interactors")
 
-    cfg = load_or_die(config, overrides)
+    # interactors never reads the forcefield: it works from Topology_recognition/
+    cfg = load_or_die(config, overrides, require_forcefield=False)
 
     require_path("topology", cfg.topology, must_exist=True)
     require_path("outpath",  cfg.outpath,  must_exist=False)
@@ -143,9 +163,12 @@ def interactors(
     print_summary("Tuning", {
         "max_DA_charge":        cfg.interactors.max_DA_charge,
         "min_H_charge":         cfg.interactors.min_H_charge,
+        "DA_masses":            cfg.interactors.DA_masses,
         "min_abs_charge":       cfg.interactors.min_abs_charge,
+        "min_residue_charge":   cfg.interactors.min_residue_charge,
         "max_abs_charge":       cfg.interactors.max_abs_charge,
         "max_num_heavy_ats":    cfg.interactors.max_num_heavy_ats,
+        "min_num_heavy_ats":    cfg.interactors.min_num_heavy_ats,
         "min_bonds_to_charged": cfg.interactors.min_bonds_to_charged,
         "min_bonds_to_polar":   cfg.interactors.min_bonds_to_polar,
     })
@@ -187,6 +210,7 @@ def interactors(
                 min_abs_charge=cfg.interactors.min_abs_charge,
                 max_abs_charge=cfg.interactors.max_abs_charge,
                 max_num_heavy_ats=cfg.interactors.max_num_heavy_ats,
+                min_num_heavy_ats=cfg.interactors.min_num_heavy_ats,
                 min_bonds_to_charged=cfg.interactors.min_bonds_to_charged,
                 min_bonds_to_polar=cfg.interactors.min_bonds_to_polar,
                 named_rules=cfg.interactors.named_interactors_rules,
@@ -197,7 +221,7 @@ def interactors(
         print_error(f"interactors failed: {e}")
         raise typer.Exit(code=1)
 
-    dump_run_config(cfg, cfg.outpath)
+    dump_run_config(cfg, cfg.outpath, sections=["interactors"])
     print_success(f"interactors complete → {int_out}")
 
 

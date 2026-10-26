@@ -196,7 +196,7 @@ def compare_variants(
     }, stage_key="network")
     overrides.update(network_overrides)
 
-    cfg = load_or_die(config, overrides)
+    cfg = load_or_die(config, overrides, require_forcefield=False)
     cv_cfg, net_cfg = cfg.compare_variants, cfg.network
 
     require_path("topology", cfg.topology, must_exist=True)
@@ -318,7 +318,7 @@ def compare_variants(
         print_error(f"compare-variants failed: {escape(str(e))}")
         raise typer.Exit(code=1)
 
-    dump_run_config(cfg, cfg.outpath)
+    dump_run_config(cfg, cfg.outpath, sections=["compare_variants"])
 
     sites = cv.clinvar_sites
     mapped = sites[sites["resindex"].notna()]

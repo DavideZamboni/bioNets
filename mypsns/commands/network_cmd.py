@@ -131,13 +131,14 @@ def network(
     min_persistency: Optional[float] = typer.Option(
         None, "--min-persistency",
         help="Persistency edge threshold (percent, 0..100). Weighted graphs keep "
-             "edges > this; unweighted graphs keep an edge (weight 1) where \u2265 this.",
+             "edges > this; unweighted graphs keep an edge (weight 1) where > this "
+             "(strict, like PyInteraph's filter_graph).",
         rich_help_panel=PANEL_FILTER,
     ),
     min_energy: Optional[float] = typer.Option(
         None, "--min-energy",
         help="Energy edge threshold (percent of strongest edge, 0..100). Weighted "
-             "graphs keep edges > this; unweighted graphs keep an edge where \u2265 this.",
+             "graphs keep edges > this; unweighted graphs keep an edge where > this.",
         rich_help_panel=PANEL_FILTER,
     ),
     min_degree: Optional[int] = typer.Option(
@@ -147,7 +148,8 @@ def network(
     ),
     reference_pdb: Optional[Path] = typer.Option(
         None, "--reference-pdb",
-        help="PDB to load in PyMOL (default: --topology).",
+        help=("PDB the .pml scripts load (default: the corrected topology "
+              "contacts wrote, Adjacency/<name>_correct.pdb; else --topology)."),
         rich_help_panel=PANEL_PYMOL,
     ),
     sphere_scale: Optional[float] = typer.Option(
@@ -232,7 +234,7 @@ def network(
         "shortest_paths":      shortest_paths,
     }, stage_key="network")
 
-    cfg = load_or_die(config, overrides)
+    cfg = load_or_die(config, overrides, require_forcefield=False)
 
     require_path("topology", cfg.topology, must_exist=True)
     require_path("outpath",  cfg.outpath,  must_exist=True)
@@ -249,7 +251,10 @@ def network(
                     "Run `mypsns interactors` first.")
         raise typer.Exit(code=2)
 
-    ref_pdb = cfg.network.reference_pdb or cfg.topology
+    # Network prefers the corrected PDB contacts wrote: its resids are the
+    # Resindex values the PyMOL selectors use
+    corrected = sorted(adj_in.glob("*_correct.pdb")) if adj_in.exists() else []
+    ref_pdb = cfg.network.reference_pdb or (corrected[0] if corrected else cfg.topology)
 
     print_banner("network", subtitle=str(net_out))
     print_summary("Inputs", {
@@ -398,7 +403,7 @@ def network(
         print_error(f"network failed: {e}")
         raise typer.Exit(code=1)
 
-    dump_run_config(cfg, cfg.outpath)
+    dump_run_config(cfg, cfg.outpath, sections=["network"])
 
     pml_list = "\n  ".join(str(p) for p in written_pml) if written_pml else "(none)"
     msg = f"network complete → {net_out}\n  PyMOL sessions:\n  {pml_list}"

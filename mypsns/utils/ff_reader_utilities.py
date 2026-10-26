@@ -302,30 +302,40 @@ def get_numfloats(ll:List[str]) -> int:
             True
     return  num_floats
 
-def add_bonds_ctrl_atoms(residues:dict, myTername: str, 
+def has_bond_token(bonds: str, token: str) -> bool:
+    '''
+    Whether `token` is one of the space-separated entries of a bonds string.
+    The checks used to be substring tests, which fail whenever the name is part
+    of another entry: "N" is "in" "-HN" (an NH3+ [ delete ] entry), so the
+    added H1-H3 never got their bond to N, and "HT1" is "in" "-HT1", so a
+    control atom never got the added atom that the patch also deletes.
+    '''
+    return token in bonds.split()
+
+def add_bonds_ctrl_atoms(residues:dict, myTername: str,
                          toadd: List, atname: str) ->  dict:
     # adding 1st control atom i
-    if toadd[2] not in residues['bonds'][-1]:
+    if not has_bond_token(residues['bonds'][-1], toadd[2]):
         residues['bonds'][-1] += f' {toadd[2]}'
         log.debug(f'| {residues["tdb_file"][-1]:^7} | {residues["resname"][-1]:^7} | {residues["atom_name"][-1]:^9} | {residues["atom_type"][-1]:^9} | {residues["charge"][-1]:^6} | {residues["chargegroup"][-1]:^11} | {residues["bonds"][-1]:^11} |\n')
-    # Then need to add this atom to the bonds of the 1st control atom i, 
+    # Then need to add this atom to the bonds of the 1st control atom i,
     # also check to add control atom j to bonds of i.
     # If i not found, store info about bond i-j into newly created atom as +j
     ix = get_index(residues, toadd[2], myTername)
     if ix is not None:
-        if atname not in residues['bonds'][ix]:
+        if not has_bond_token(residues['bonds'][ix], atname):
             residues['bonds'][ix] += f' {atname}'
 
-        if toadd[3] not in residues['bonds'][ix]:
+        if not has_bond_token(residues['bonds'][ix], toadd[3]):
             residues['bonds'][ix] += f' {toadd[3]}'
     else:
-        if toadd[3] not in residues['bonds'][-1]:
+        if not has_bond_token(residues['bonds'][-1], f'+{toadd[3]}'):
             residues['bonds'][-1] += f' +{toadd[3]}'
-        
+
     # adding 1st control atom i to bond information of 2nd control atom j
     ix_j = get_index(residues, toadd[3], myTername)
     if ix_j is not None:
-        if toadd[3] not in residues['bonds'][ix_j]:
+        if not has_bond_token(residues['bonds'][ix_j], toadd[2]):
             residues['bonds'][ix_j] += f' {toadd[2]}'
 
     return residues
@@ -357,7 +367,7 @@ def add_atoms(ll:List[str], residues:dict, myfname: str, myTername: str,
         if len(toremove) > 0:
             #log.debug(f'num_floats == 3, toadd[0] > 1, len(toremove) > 0, {len(toremove)}, {toremove}\n')
             residues['bonds'][-1] += toremove
-        if toadd[2] not in residues['bonds'][-1]:
+        if not has_bond_token(residues['bonds'][-1], toadd[2]):
             residues['bonds'][-1] += f' {toadd[2]} '
         
         residues = add_bonds_ctrl_atoms(residues, myTername, toadd, atname)

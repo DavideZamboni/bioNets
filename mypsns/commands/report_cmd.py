@@ -27,8 +27,9 @@ def report(
     """
     Summarise outputs found in a run folder.
 
-    Walks the standard pipeline subfolders (Topology_recognition/, Interactors/,
-    Contacts/) and reports which stages have produced final outputs.
+    Walks the standard pipeline subfolders (forcefield/, Topology_recognition/,
+    Interactors/, Adjacency/<inttype>/, Network/<inttype>/) and reports which
+    stages have produced final outputs.
     """
     outpath = Path(outpath).expanduser()
     if not outpath.exists():
@@ -41,6 +42,7 @@ def report(
         "topology_recognition": _topology_status(outpath),
         "interactors":          _interactors_status(outpath),
         "contacts":             _contacts_status(outpath),
+        "network":              _network_status(outpath),
     }
 
     if json_output:
@@ -51,7 +53,7 @@ def report(
 
     # Stage table
     stage_rows: list[tuple[str, str, str]] = []
-    for stage in ("ff_reader", "topology_recognition", "interactors", "contacts"):
+    for stage in ("ff_reader", "topology_recognition", "interactors", "contacts", "network"):
         s = payload[stage]
         status = "[green]✓[/green]" if s["complete"] else "[yellow]—[/yellow]"
         stage_rows.append((stage, status, s.get("summary", "")))
@@ -68,11 +70,20 @@ def report(
 
     # Contacts details
     cn_info = payload["contacts"]
-    if cn_info["complete"]:
-        print_summary("Contacts", {
-            "final tables":    cn_info.get("finals", []),
-            "adjacency files": cn_info.get("adjacencies", []),
-            "elbow CSVs":      cn_info.get("elbow_csvs", 0),
+    for inttype, info in cn_info.get("schemes", {}).items():
+        print_summary(f"Contacts — {inttype}", {
+            "final tables":    info["finals"],
+            "adjacency files": info["adjacencies"],
+            "energy matrices": info["energies"],
+            "elbow CSVs":      info["elbow_csvs"],
+        })
+
+    nw_info = payload["network"]
+    for inttype, info in nw_info.get("schemes", {}).items():
+        print_summary(f"Network — {inttype}", {
+            "node tables":   info["node_tables"],
+            "PyMOL scripts": info["pml"],
+            "matrices":      info["matrices"],
         })
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -135,24 +146,55 @@ def _interactors_status(outpath: Path) -> dict:
     }
 
 
+def _scheme_dirs(root: Path) -> list:
+    """<root>/<inttype>/ folders (named_interactors, q_interactors), sorted."""
+    if not root.exists():
+        return []
+    return sorted(d for d in root.iterdir()
+                  if d.is_dir() and d.name.endswith("_interactors"))
+
+
 def _contacts_status(outpath: Path) -> dict:
-    cnt = outpath / "Contacts"
-    if not cnt.exists():
+    # contacts writes one Adjacency/<inttype>/ folder per interactor scheme
+    schemes = {}
+    for d in _scheme_dirs(outpath / "Adjacency"):
+        finals = sorted(p.name for p in d.glob("*_final.csv"))
+        if not finals:
+            continue
+        schemes[d.name] = {
+            "finals":      finals,
+            "adjacencies": sorted(p.name for p in d.glob("*_adjacency.dat")),
+            "energies":    len(list(d.glob("*_energy.dat"))),
+            "elbow_csvs":  len(list(d.glob("*graph_report/csvs/*_elbow.csv"))),
+        }
+    if not schemes:
         return {"complete": False, "summary": "stage not run"}
-
-    finals      = [p.name for p in cnt.glob("*_final.csv")]
-    adjacencies = [p.name for p in cnt.glob("*_adjacency.dat")]
-    elbows      = list((cnt / "csvs").glob("*_persistency_elbow.csv")) \
-                  if (cnt / "csvs").exists() else []
-
-    if not finals:
-        return {"complete": False, "summary": "no _final.csv files yet"}
     return {
-        "complete":    True,
-        "summary":     f"{len(finals)} final table(s), {len(adjacencies)} adjacency matrix(es)",
-        "finals":      finals,
-        "adjacencies": adjacencies,
-        "elbow_csvs":  len(elbows),
+        "complete": True,
+        "summary":  ", ".join(f"{k}: {len(v['finals'])} final table(s)"
+                              for k, v in schemes.items()),
+        "schemes":  schemes,
+    }
+
+
+def _network_status(outpath: Path) -> dict:
+    schemes = {}
+    for d in _scheme_dirs(outpath / "Network"):
+        nodes = list((d / "csv").glob("nodes_*.csv"))
+        if not nodes:
+            continue
+        schemes[d.name] = {
+            "node_tables": len(nodes),
+            "pml":         len(list(d.glob("*_metrics/*.pml"))),
+            "matrices":    len(list(d.glob("matrices/*_adjacency.dat"))),
+        }
+    if not schemes:
+        return {"complete": False, "summary": "stage not run"}
+    return {
+        "complete": True,
+        "summary":  ", ".join(f"{k}: {v['node_tables']} node table(s)"
+                              for k, v in schemes.items()),
+        "schemes":  schemes,
     }
 
 

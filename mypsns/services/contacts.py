@@ -95,9 +95,10 @@ class Contacts:
         - ``surrounding_chains`` (all chains in topology)
 
     Geometric cutoffs
-        - ``d_a_dist`` (5 Å) – H-bond donor–acceptor distance
-        - ``angle`` (150°) – H-bond D–H–A angle
-        - ``sb_cutoff`` (5 Å) – salt-bridge distance
+        - ``d_a_dist`` (4.5 Å) – H-bond donor–acceptor distance
+        - ``angle`` (120°) – H-bond D–H–A angle
+        - ``d_h_cutoff`` (1.4 Å) – donor–hydrogen pairing distance (Cys S–H is 1.32 Å)
+        - ``sb_cutoff`` (4.5 Å) – salt-bridge distance
         - ``hc_cutoff`` (5 Å) – hydrophobic-cluster distance
     """
 

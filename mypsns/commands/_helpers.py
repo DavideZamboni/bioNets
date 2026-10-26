@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, Sequence
 
 import typer
 
@@ -56,11 +56,16 @@ def collect_overrides(
 def load_or_die(
     config_path: Optional[Path],
     overrides: Optional[dict] = None,
+    require_forcefield: bool = True,
 ) -> PipelineConfig:
-    """Build the pipeline config or exit cleanly with a clear error."""
+    """Build the pipeline config or exit cleanly with a clear error.
+
+    `require_forcefield=False` is for stages that never read the forcefield
+    path (`interactors`, `contacts`, `network`, `compare-variants`)."""
     try:
         return build_pipeline_config(
             config_path=config_path, overrides=overrides or {},
+            require_forcefield=require_forcefield,
         )
     except ConfigError as e:
         print_error(str(e))
@@ -72,17 +77,38 @@ def ensure_dir(path: Path) -> None:
     Path(path).mkdir(parents=True, exist_ok=True)
 
 
-def dump_run_config(cfg: PipelineConfig, outpath: Path) -> Path:
-    """Save the resolved config to <outpath>/run_config.yaml for reproducibility."""
+def dump_run_config(
+    cfg:      PipelineConfig,
+    outpath:  Path,
+    sections: Optional[Sequence[str]] = None,
+) -> Path:
+    """Save the resolved config to <outpath>/run_config.yaml for reproducibility.
+
+    A single stage passes the config section(s) it owns (``["contacts"]``):
+    only those are replaced in an existing file, so a later stage run from
+    flags does not overwrite what earlier stages recorded. `mypsns run` passes
+    its four stages; ``None`` writes the whole config.
+    """
     ensure_dir(outpath)
     dump_path = outpath / "run_config.yaml"
-    save_pipeline_config(cfg, dump_path)
+    save_pipeline_config(cfg, dump_path, sections=sections)
     return dump_path
 
 
 def stage_done(marker: Path) -> bool:
     """True if the given marker file/folder exists (used by --resume)."""
     return Path(marker).exists()
+
+
+def contacts_done(cfg: PipelineConfig) -> bool:
+    """True if every requested interactor scheme already has its per-type
+    persistency matrices (``Adjacency/<inttype>/*_adjacency.dat``, written once
+    all contacts are in). `contacts` and `mypsns run` skip the stage on this.
+    Both used to look for markers that never exist (``Adjacency/*.dat``,
+    ``Adjacency/graph_report/plot``), so contacts was always recomputed."""
+    adj = Path(cfg.outpath) / "Adjacency"
+    return all(any((adj / inttype).glob("*_adjacency.dat"))
+               for inttype in cfg.contacts.interactors_type)
 
 def show_paths(cfg: PipelineConfig, *, include_trajectory: bool = True) -> None:
     """Print a compact paths summary."""

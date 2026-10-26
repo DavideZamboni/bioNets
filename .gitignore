@@ -29,6 +29,10 @@ env/
 
 # MD data — usually too big for git
 *.xtc
+!tests/data/**/*.xtc
 *.trr
 *.dcd
 *.edr
+# MDAnalysis trajectory offset caches, written next to the trajectory
+.*_offsets.npz
+.*_offsets.lock

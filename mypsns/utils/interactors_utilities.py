@@ -42,7 +42,8 @@ import networkx as nx
 import MDAnalysis as mda
 import logging
 
-from mypsns.config import NAMED_INTERACTOR_DEFAULTS
+from mypsns.config import NAMED_INTERACTOR_DEFAULTS, InteractorsConfig
+from mypsns.utils.topology_recognition_utilities import structure_named
 
 log = logging.getLogger(__name__)
 
@@ -63,6 +64,16 @@ log = logging.getLogger(__name__)
 
 # Roles evaluated as selection rules (everything except the scalar hb_masses).
 NAMED_INTERACTOR_ROLES: List[str] = ["HC", "HDon", "HAcc", "Basic", "Acidic"]
+
+# The InteractorsConfig fields get_charge_based_interactors reads. Their
+# defaults come from InteractorsConfig (the single source of truth); every one
+# of them also has an `interactors` CLI flag.
+CHARGE_BASED_PARAMETERS = (
+    'max_DA_charge', 'min_H_charge', 'DA_masses',               # H-bond
+    'min_abs_charge',                                           # salt bridge
+    'max_abs_charge', 'max_num_heavy_ats', 'min_num_heavy_ats', # HC
+    'min_bonds_to_charged', 'min_bonds_to_polar',
+)
 
 
 def _rules_from_config(role_rules: list) -> List[list]:
@@ -346,8 +357,10 @@ def extract_chain_bounds(
         chids = list({(at.resnum, at.chainID) for at in universe.atoms})
     except mda.exceptions.NoDataError:
         chids = list({(at.resnum, None) for at in universe.atoms})
- 
-    chids.sort(key=lambda x: x[0])
+
+    # full sort key: by resnum alone, chains sharing a resnum kept their
+    # (hash-seed dependent) set order
+    chids.sort(key=lambda x: (x[0], str(x[1])))
     # dict to store start/end of each chain
     top_chains: Dict[str, Tuple[int, int]] = {}
  
@@ -385,7 +398,7 @@ def fill_bond_info(
  
     for res_df_path in topologies:
         rdf_name = Path(res_df_path).name
-        res_df = pd.read_csv(res_df_path, header=0, index_col=False, na_values = nas)
+        res_df = pd.read_csv(res_df_path, header=0, index_col=False, na_values = nas, keep_default_na = False)
  
         if res_df.shape[0] <= 1:
             top_df_dict[rdf_name] = res_df_path
@@ -443,9 +456,18 @@ def build_wholetop(
     chunks: List[pd.DataFrame] = []
     resid_to_top = resid_to_top.sort_values('Resindex')
  
+    # Per-residue topologies keep the forcefield's atom names, with the
+    # structure's in structure_atom_name (accept-topology can pair differently
+    # named atoms). Everything from here on, and the contacts join with the
+    # structure on (Resindex, atom_name), uses the structure's names.
+    named: Dict[str, pd.DataFrame] = {}
     for _, row in resid_to_top.iterrows():
         rdf_name = row['topology']
-        tmp = pd.read_csv(top_df_dict[rdf_name], header=0, index_col=False, na_values=nas)
+        if rdf_name not in named:
+            named[rdf_name] = structure_named(
+                pd.read_csv(top_df_dict[rdf_name], header=0, index_col=False, na_values=nas,
+                            keep_default_na=False))
+        tmp = named[rdf_name].copy()
         tmp['Resindex'] = row['Resindex']
         chunks.append(tmp)
  
@@ -575,6 +597,20 @@ def get_resname(rdf: pd.DataFrame) -> str:
             resname = r
             maxc = rn_df.shape[0]
     return resname
+
+def residue_name(rdf: pd.DataFrame, patch_resnames: Set[str]) -> str:
+    """Forcefield name of the residue a single-residue table describes.
+
+    A terminal residue mixes rows of its own entry (resname LEU) with rows of
+    the terminal patch (resname COO-, NH3+, …), so the most frequent resname is
+    not reliable: a Gly-NH3+ patch replaces most of a glycine. Patch rows,
+    recognised by the patch names of forcefield/final_ff_ters.csv, are left out
+    first. This is the `residue` attribute of named_interactors rules, which
+    lets a rule reach a terminal residue's patch atoms (PyInteraph selects HC
+    side chains from every atom of the residue).
+    """
+    own = rdf[~rdf['resname'].isin(patch_resnames)]
+    return get_resname(own if not own.empty else rdf)
 
 ## NEW METHOD
 def build_residue_variants(
@@ -924,24 +960,125 @@ def score(
     )
     return (viol, -min(sizes, default=0))
 
+def sorted_components(G: nx.Graph) -> List[List[str]]:
+    '''
+    Connected components of G as sorted lists of atom names, ordered by their
+    first name. networkx returns each component as a set, and a set of strings
+    iterates in an order set by Python's string hash, which changes with
+    PYTHONHASHSEED (i.e. between runs). The greedy HC split took the first of
+    several equally good cuts, so any such order reached its result: PHE, TRP
+    and LEU side chains were split differently from run to run.
+    '''
+    return sorted(sorted(c) for c in nx.connected_components(G))
+
+# Work (candidate clusters examined) best_partition may spend on one connected
+# group of HC atoms before giving up on it. Amino acids and lipid tails need a
+# few hundred at most (POPC: 114); 24-36-atom fused-ring grids, denser than any
+# residue's HC atoms, need up to ~5e4 (0.3 s). The budget is ~1 s of search;
+# past it (a huge residue, or a large max_num_heavy_ats) the group is split
+# greedily instead, with a warning.
+MAX_PARTITION_WORK = 250_000
+
+class _PartitionBudgetExceeded(Exception):
+    pass
+
+def best_partition(
+        G: nx.Graph,
+        nodes: List[str],
+        min_num_heavy_ats: int,
+        max_num_heavy_ats: int,
+        ) -> Optional[List[List[str]]]:
+    '''
+    The best split of one connected group of HC atoms (`nodes`, bonds in G)
+    into connected clusters, by exact search. Best means, in this order:
+     1. the fewest size violations, sum over clusters of how far each falls
+        outside [min_num_heavy_ats, max_num_heavy_ats];
+     2. the fewest clusters (so clusters come as close to max_num_heavy_ats
+        as the bonds allow);
+     3. the alphabetically first partition (each cluster sorted by atom name,
+        then the list of clusters), so the result is unique.
+    PHE (CB + ring) gives CB CD1 CG / CD2 CE2 / CE1 CZ, where the greedy split
+    gave CB / CD1 CD2 CG / CE1 CE2 CZ (one cluster below the minimum).
+
+    The search branches on the cluster that holds the alphabetically first
+    remaining atom (every connected set of at most max_num_heavy_ats atoms
+    around it) and memoises the best split of each set of remaining atoms.
+    Returns None when it would examine more than MAX_PARTITION_WORK
+    candidate clusters.
+    '''
+    nodeset = set(nodes)
+    nbr = {a: sorted(n for n in G[a] if n in nodeset) for a in nodes}
+    memo: Dict[frozenset, tuple] = {}
+    work = 0
+
+    def clusters_with(first, remaining):
+        # every connected subset of `remaining` with `first`, up to the max size
+        seen = set()
+        todo = [frozenset([first])]
+        while todo:
+            block = todo.pop()
+            if block in seen:
+                continue
+            seen.add(block)
+            yield block
+            if len(block) < max_num_heavy_ats:
+                for a in block:
+                    for n in nbr[a]:
+                        if n in remaining and n not in block:
+                            todo.append(block | {n})
+
+    def solve(remaining):
+        nonlocal work
+        if not remaining:
+            return (0, 0, ())
+        if remaining in memo:
+            return memo[remaining]
+        best = None
+        for block in clusters_with(min(remaining), remaining):
+            work += 1
+            if work > MAX_PARTITION_WORK:
+                raise _PartitionBudgetExceeded
+            viol, n_clusters, parts = solve(remaining - block)
+            size = len(block)
+            cand = (viol + max(0, min_num_heavy_ats - size) + max(0, size - max_num_heavy_ats),
+                    n_clusters + 1,
+                    tuple(sorted(parts + (tuple(sorted(block)),))))
+            if best is None or cand < best:
+                best = cand
+        memo[remaining] = best
+        return best
+
+    try:
+        return [list(c) for c in solve(frozenset(nodes))[2]]
+    except (_PartitionBudgetExceeded, RecursionError):
+        return None
+
 def split(
         G: nx.Graph,
         nodes: List[str],
         min_num_heavy_ats: int,
         max_num_heavy_ats: int
         ) -> List[List[str]]:
-    
+    '''
+    Greedy split, the fallback of get_constrained_conncomps when best_partition
+    gives up: commit the single cut that scores best on its own, then recurse.
+    It can miss a split without size violations (see best_partition).
+    '''
+
+    nodes = sorted(nodes)
     if len(nodes) <= max_num_heavy_ats:
         return [nodes]
-    
+
     sub = G.subgraph(nodes)
-    edges = list(sub.edges())
+    # Probe the cuts in a fixed (sorted) order: on a tie in score the first
+    # cut probed wins, so the order must not come from set iteration.
+    edges = sorted(tuple(sorted(e)) for e in sub.edges())
     if not edges:
         return [nodes]
     best = (float('inf'), float('inf')), None, None
     for u, v in edges:
         G.remove_edge(u, v)
-        comps = [list(c) for c in nx.connected_components(G.subgraph(nodes))]
+        comps = sorted_components(G.subgraph(nodes))
         sc = score([len(c) for c in comps], min_num_heavy_ats, max_num_heavy_ats)
         if sc < best[0]:
             best = sc, (u, v), comps
@@ -961,23 +1098,35 @@ def get_constrained_conncomps(
     max_num_heavy_ats: int,
 ) -> List[List[str]]:
     '''
-    Builds an undirected graph from `adj` and greedily removes edges so
-    every connected component has size in [min_num_heavy_ats,
-    max_num_heavy_ats]. At each step every internal edge of an oversized
-    component is probed; the cut minimizing (total size violations,
-    -smallest sub-component) is committed, then both sides recurse.
+    Builds an undirected graph from `adj` (HC atom -> bonded HC atoms) and
+    splits each connected group of atoms into connected clusters of
+    min_num_heavy_ats..max_num_heavy_ats atoms where the bonds allow it: a
+    group that fits is kept whole, a larger one gets best_partition (the
+    greedy split only when that exceeds its work budget).
+
+    Deterministic: nodes, edges and components are visited in sorted order,
+    and the clusters are returned sorted (each by atom name, the list by first
+    atom name), which is the order add_hc_atoms numbers them HC1, HC2, ...
     '''
     G = nx.Graph()
-    G.add_nodes_from(adj.keys())
-    for u, nbrs in adj.items():
-        for v in nbrs:
+    G.add_nodes_from(sorted(adj.keys()))
+    for u in sorted(adj):
+        for v in sorted(adj[u]):
             if u != v:
                 G.add_edge(u, v)
 
     result: List[List[str]] = []
-    for c in nx.connected_components(G):
-        result.extend(split(G, list(c), min_num_heavy_ats, max_num_heavy_ats))
-    return result
+    for c in sorted_components(G):
+        if len(c) <= max_num_heavy_ats:
+            result.append(c)
+            continue
+        parts = best_partition(G, c, min_num_heavy_ats, max_num_heavy_ats)
+        if parts is None:
+            log.warning('HC split: %d bonded HC atoms (%s, ...) exceed the exact search '
+                        'budget; splitting them greedily', len(c), ' '.join(c[:5]))
+            parts = split(G, c, min_num_heavy_ats, max_num_heavy_ats)
+        result.extend(parts)
+    return sorted(sorted(c) for c in result)
 
 def cluster(
     hcs:               List[str],
@@ -1032,6 +1181,7 @@ def add_hc_atoms(
     min_abs_charge:       float = 0.75,   # SB-rule threshold (charged)
     max_DA_charge:        float = -0.3,   # HBond donor/acceptor thr → polar (heavy)
     min_H_charge:         float =  0.3,   # Hbond H charge
+    min_num_heavy_ats:    int   = 2,      # soft lower bound of the cluster split
 ) -> pd.DataFrame:
     """
     Identify hydrophobic-cluster atoms.  A heavy atom is HC iff:
@@ -1044,6 +1194,14 @@ def add_hc_atoms(
 
     Polar set is broader and uses the smaller bond-distance threshold; SB anchors
     are sparser and use the stricter (larger) one.
+
+    The HC atoms of a residue are then split into bond-contiguous clusters of
+    min_num_heavy_ats..max_num_heavy_ats heavy atoms (get_constrained_conncomps;
+    the lower bound is soft, a residue with a single HC atom keeps it alone).
+    Each cluster gets its bonded H atoms and the label HC1, HC2, ... in the
+    HC_cluster column. The split is deterministic, and the labels are stored in
+    the interactors output: contacts reads them back (one centre of mass per
+    label) and never re-clusters.
     """
     log.debug('HC identification: max_abs_charge=%s max_num_heavy_ats=%s '
               'min_bonds_to_charged=%s min_bonds_to_polar=%s min_abs_charge=%s '
@@ -1111,10 +1269,13 @@ def add_hc_atoms(
         if not true_hcs:
             continue
 
-        hcs    = list({a[0] for a in true_hcs})
+        # sorted, not list(set): a set's order follows PYTHONHASHSEED and used
+        # to reach the cluster split (see sorted_components)
+        hcs    = sorted({a[0] for a in true_hcs})
         act_df = df[df['Resindex'] == resix]
         hc_clusters = (
-            cluster(hcs, indf, max_num_heavy_ats=max_num_heavy_ats)
+            cluster(hcs, indf, max_num_heavy_ats=max_num_heavy_ats,
+                    min_num_heavy_ats=min_num_heavy_ats)
             if len(hcs) > 1 else [hcs]
         )
         log.debug('HC   clusters: %s', hc_clusters)
@@ -1383,7 +1544,7 @@ def fill_hydrogen_selections(
         new_hbond_indices.extend(candidates.index.tolist())
 
     if new_hbond_indices:
-        new_hbond_indices = list(set(new_hbond_indices))
+        new_hbond_indices = sorted(set(new_hbond_indices))
         for ix in new_hbond_indices:
             # Tag as an HBond hydrogen but KEEP any HC tag: a donor-bound H such
             # as the backbone amide HN, or Trp HE1, is both an HBond hydrogen and
@@ -1486,25 +1647,26 @@ def get_charge_based_interactors(
          - ``min_abs_charge`` (0.75): min absolute charge of a chargegroup 
      - HC:
          - ``max_abs_charge`` (0.27): max possible charge for HC atoms
-         - ``max_num_heavy_ats`` (3): Bond-contiguous HC groups are split into sub-clusters of 3 heavy atoms each 
-         - ``min_bonds_to_charged`` (3): minimum nuber of bonds separing a charged etom (w |charge| > max_abs_charge) 
-                                         and an HC atom to include it in HC clusters 
+         - ``max_num_heavy_ats`` (3): Bond-contiguous HC groups are split into sub-clusters of 3 heavy atoms each
+         - ``min_num_heavy_ats`` (2): soft lower bound on the heavy atoms of a sub-cluster
+         - ``min_bonds_to_charged`` (3): minimum nuber of bonds separing a charged etom (w |charge| > max_abs_charge)
+                                         and an HC atom to include it in HC clusters
+         - ``min_bonds_to_polar`` (1): same, from a polar heavy atom
+
+    Every parameter left out takes its InteractorsConfig default
+    (CHARGE_BASED_PARAMETERS), so the function and the CLI cannot disagree
+    and a call without kwargs runs. The hand-written defaults dict this
+    replaced lacked min_bonds_to_polar, so such a call raised KeyError.
+    Other kwargs (named_rules, min_residue_charge, ...: add_inttypes passes
+    the same set to both schemes) are ignored.
 
     Returns
     -------
     df:  Updated DataFrame.
     out: Updated log string (or ``None``).
     """
-    defaults = dict(
-        max_DA_charge        = -0.3,
-        min_H_charge         =  0.3,
-        DA_masses            = [14, 16, 19],
-        min_abs_charge       =  0.75,
-        max_abs_charge       =  0.27,
-        max_num_heavy_ats    =  3,
-        min_bonds_to_charged =  3,
-    )
-    defaults.update(kwargs)
+    defaults = InteractorsConfig().model_dump(include=set(CHARGE_BASED_PARAMETERS))
+    defaults.update({k: v for k, v in kwargs.items() if k in CHARGE_BASED_PARAMETERS})
 
     log.debug('Running get_charge_based_interactors')
 
@@ -1519,6 +1681,7 @@ def get_charge_based_interactors(
         df,
         max_abs_charge       = defaults['max_abs_charge'],
         max_num_heavy_ats    = defaults['max_num_heavy_ats'],
+        min_num_heavy_ats    = defaults['min_num_heavy_ats'],
         min_bonds_to_charged = defaults['min_bonds_to_charged'],
         min_bonds_to_polar   = defaults['min_bonds_to_polar'],
         # shared semantics with the other two:
@@ -1613,6 +1776,11 @@ def get_named_interactors(
     log.debug('Running get_named_interactors')
 
     df['named_interactors'] = ''
+    # `residue` rule attribute: Interactors.add_inttypes sets it knowing the
+    # forcefield's patch names. Other callers (one residue per table) get the
+    # most frequent resname, which is right unless a patch dominates.
+    if 'residue' not in df.columns:
+        df['residue'] = residue_name(df, set())
 
     # Per-charged-group net charge gate for the salt-bridge roles (Basic/Acidic).
     # Atoms are gated by the summed partial charge of their (Resindex, resname)

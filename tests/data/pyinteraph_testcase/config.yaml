@@ -1,0 +1,18 @@
+# Settings of the PyInteraph 1 validation (preset `pyinteraph_testcase`, run
+# end to end by tests/test_pyinteraph_regression.py). Everything else is the
+# myPSNs default: named_interactors rules, cutoffs SB 4.5 Å, HC 5.0 Å,
+# H-bond D–A 4.5 Å / D–H–A 120° / D–H pairing 1.4 Å.
+#
+# Paths come from the command line (run from the repo root):
+#   D=tests/data/pyinteraph_testcase
+#   mypsns run --config $D/config.yaml -t $D/structures/sim.prot.gro \
+#     -x $D/structures/traj.xtc -ff $D/forcefields/charmm36-apr2019_vm.ff -o <outpath>
+#   mypsns compare --preset pyinteraph_testcase \
+#     --computed-dir <outpath>/Adjacency/named_interactors
+interactors:
+  modes: [named_interactors]
+
+contacts:
+  interactors_type: [named_interactors]
+  # the validation compares persistency only; energies would add run time
+  matrix_type: [persistency]

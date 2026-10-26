@@ -1,968 +1,901 @@
 # myPSNs
 
-Protein Structure Network analysis from molecular-dynamics trajectories.
+Protein Structure Network (PSN) analysis of molecular-dynamics trajectories.
+From a GROMACS forcefield, a structure and a trajectory, myPSNs finds hydrogen
+bonds, salt bridges and hydrophobic contacts in every frame, turns them into
+residue × residue persistency and interaction-energy matrices, and builds
+residue networks with centralities, communities and PyMOL scripts.
 
-myPSNs builds residue–residue interaction networks (PSNs) from a GROMACS
-forcefield, a topology, and an MD trajectory. It identifies hydrogen bonds,
-salt bridges, and hydrophobic clusters per frame; aggregates them into
-persistency- and energy-weighted contact matrices; and constructs graphs with
-centrality, community detection, and PyMOL renderings.
+myPSNs re-implements **PyInteraph 1** and reads charges, masses, Lennard-Jones
+parameters and terminal patches from the forcefield itself. With its default
+settings it reproduces PyInteraph 1 on PyInteraph's own test case, which ships
+in `tests/data/`: salt bridges differ by 0.07 %, hydrophobic contacts by
+0.11 %, H-bonds by 3.9 %, and every PyInteraph edge is found
+([Validation](#validation-against-pyinteraph-1)).
 
-The default `named_interactors` role set reproduces **PyInteraph 1**: on a CHARMM
-test trajectory, salt bridges and hydrophobic clusters match to ~0.1 %, H-bonds
-to ~4.5 % (an engine-limited floor, not a parameter — see *Interactor roles &
-PyInteraph reproduction*). The rules remain fully customisable for non-standard
-residues, ions, and lipids.
+```
+ff-reader → topology → interactors → contacts      mypsns run
+                                         │
+                                      network       mypsns network
+                                         │
+                        compare  ·  compare-variants (experimental)
+```
 
-## Pipeline:
+**Part I — Using myPSNs:** [Install](#install) · [Quick start](#quick-start) ·
+[Your own system](#your-own-system) · [Command reference](#command-reference)
 
-ff-reader → topology → interactors → contacts → network
+**Part II — Developer guide:** [Repository layout](#repository-layout) ·
+[Architecture](#architecture) · [Data flow and run folder](#data-flow-and-run-folder) ·
+[Extending myPSNs](#extending-mypsns) · [Interactor rules](#interactor-rules) ·
+[Testing](#testing) · [Validation](#validation-against-pyinteraph-1) ·
+[Conventions](#conventions) · [Known issues](#known-issues-and-limitations)
 
-The first four stages produce the contact data; network consumes it. network
-is not part of mypsns run — invoke it separately once contacts has
-finished.
+The development TODO list and notes for coding agents are in
+[`CLAUDE.md`](CLAUDE.md); [`CHANGELOG.md`](CHANGELOG.md) lists changes that
+affect existing run folders.
 
-## Setup
+---
 
-cd <proj_root>/myPSN
-conda env create -f environment.yml
+# Part I — Using myPSNs
+
+## Install
+
+From the repository root:
+
+```bash
+conda env create -f environment.yml   # Python 3.11, all dependencies, `pip install -e .`
 conda activate mypsns
-pip install -e .
-
-This installs the mypsns console script. Verify with:
-
 mypsns --version
-mypsns --help
+```
+
+Without conda, `pip install -e .` installs the package and the `mypsns`
+command. Two extras exist: `pip install -e '.[dev]'` (pytest, black, ruff) and
+`pip install -e '.[variants]'` (`requests`, `biopython`, needed only by the
+experimental `compare-variants`). `environment.yml` already includes both.
 
 ## Quick start
 
-Run the contact pipeline (one of the two ways below), then build the network.
+The PyInteraph 1 test case (one 149-residue chain, 151 frames, CHARMM36) ships
+with the repository. From the repository root:
 
-With a config file (recommended)
-## Run
+```bash
+D=tests/data/pyinteraph_testcase
+OUT=/tmp/mypsns_quickstart
 
+# 1. contacts: ff-reader → topology → interactors → contacts   (~3.5 min, most of it parsing CHARMM36)
+mypsns run -t $D/structures/sim.prot.gro -x $D/structures/traj.xtc \
+           -ff $D/forcefields/charmm36-apr2019_vm.ff -o $OUT --nc 4
+
+# 2. networks, keeping residue pairs in contact in more than 20 % of the frames   (seconds)
+mypsns network -t $D/structures/sim.prot.gro -o $OUT --min-persistency 20
+
+# 3. agreement with PyInteraph 1 on the same trajectory
+mypsns compare --preset pyinteraph_testcase --computed-dir $OUT/Adjacency/named_interactors
+mypsns compare --truth macroIIN=$D/pyinteraph/macro-IIN.dat \
+  --computed macroIIN=$OUT/Network/named_interactors/matrices/persistency_unweighted_network_adjacency.dat
+
+# 4. what each stage produced
+mypsns report $OUT
+```
+
+The first `compare` checks the three contact matrices against the preset's
+tolerances (exit code 1 above them):
+
+```text
+┃ Type   ┃ Edges T ┃ Edges C ┃ Shared ┃ Only T ┃ Only C ┃ ≠ value ┃ % diff ┃ Status     ┃
+│ HBonds │     282 │     309 │    282 │      0 │     27 │     213 │  3.929 │ ok ≤ 4.2 % │
+│ HC     │      79 │      79 │     79 │      0 │      0 │      56 │ 0.1118 │ ok ≤ 0.2 % │
+│ SB     │      21 │      21 │     21 │      0 │      0 │      17 │ 0.0735 │ ok ≤ 0.2 % │
+```
+
+T is PyInteraph (truth), C is myPSNs (computed); `% diff` is
+`100·Σ|C − T| / ΣT`. The second compares the binary network with PyInteraph's
+macro-IIN at the same 20 % cutoff: 192 PyInteraph edges, all found, plus 5
+H-bond pairs that myPSNs puts just above the cutoff.
+
+### What a run folder contains
+
+```
+$OUT/
+├── run_config.yaml                    every setting each stage used
+├── forcefield/                        the parsed forcefield (ff-reader)
+├── Topology_recognition/              residue ↔ forcefield matching (topology)
+├── Interactors/                       atom roles per residue variant (interactors)
+├── Adjacency/                         contacts
+│   ├── sim.prot_correct.pdb           the structure renumbered by residue index
+│   └── named_interactors/             (and q_interactors/, one folder per role scheme)
+│       ├── adjacency_labels.dat       row/column order of every matrix: index, Chain:RES:index
+│       ├── {SB,Hbonds,HC}_adjacency.dat          persistency, % of frames
+│       ├── {SB,Hbonds,HC}_total_energy.dat       mean interaction energy, kJ/mol
+│       ├── {SB,Hbonds,HC}_final.csv              residue pairs, frames in contact, mean distance
+│       └── graph_report/plots/*_elbow.png        edge-threshold scans, to choose --min-persistency
+└── Network/
+    └── named_interactors/
+        ├── csv/nodes_<label>_<method>.csv        per residue: centralities, community
+        ├── csv/edges_<label>.csv
+        ├── node_metrics/<label>_<metric>.pml     PyMOL: spheres sized by a centrality
+        ├── community_metrics/<label>_<method>.pml   PyMOL: spheres and edges coloured by community
+        └── matrices/<label>_network_adjacency.dat   the final graph, same format as Adjacency/
+```
+
+`<label>` is `persistency`, `energy`, `persistency_unweighted` or
+`energy_unweighted` (one graph per edge-weight source and weighting). Open a
+`.pml` script in PyMOL (`pymol <file>.pml`). Full layouts are in the
+[command reference](#command-reference).
+
+The same two steps from a config file (it points at the test case and writes
+`/tmp/mypsns_example`):
+
+```bash
 mypsns run     --config example_config.yaml
-mypsns network --config example_network_config.yaml
-
-With explicit flags (minimal arguments)
-
-mypsns run \
-  --topology   system.gro \
-  --forcefield charmm36.ff \
-  --trajectory traj.xtc \
-  --outpath    run_out
-
-mypsns network \
-  --topology system.gro \
-  --outpath  run_out \
-  --edge-weight-source persistency \
-  --edge-weight-source energy
-
-Any config value can be overridden on the command line; flags win over the YAML.
-Use --dry-run on any stage to validate inputs and print the plan without
-executing.
-
-## CLI commands
-
-| Command              | Purpose
-|----------------------|----------------------
-| `mypsns run`         | Full pipeline (ff-reader → topology → interactors → contacts).
-| `mypsns ff-reader`   | Parse a GROMACS forcefield folder.
-| `mypsns topology`    | Match topology residues against the forcefield.
-| `mypsns accept-topology` | Promote a proposed forcefield candidate for residues `topology` could not match (see [Unmatched residues](#unmatched-residues-mypsns-accept-topology)).
-| `mypsns interactors` | Assign interaction roles to topology atoms.
-| `mypsns contacts`    | Compute contacts across an MD trajectory.
-| `mypsns network`     | Build residue-interaction networks and render PyMOL sessions.
-| `mypsns compare`     | Compare residue matrices with reference ones (e.g. PyInteraph graphs or macro-IIN); see [Checking a run against PyInteraph](#checking-a-run-against-pyinteraph).
-| `mypsns compare-variants` | Rank network metrics against ClinVar pathogenicity (experimental; needs the `variants` extra).
-| `mypsns guess_ff`    | Suggest candidate forcefield sub-folders under a path.
-| `mypsns validate`    | Validate a config and its referenced files.
-| `mypsns report`      | Summarise the outputs in a run folder.
-
-Run `mypsns <command> --help` for the full option list of any stage.
-
-## General notes
-
-## Project structure
-
-```
-mypsns/
-├── cli.py                  console entry point (Typer)
-├── config.py               Pydantic config models
-├── commands/               one module per CLI subcommand
-├── services/
-│   ├── ff_reader.py
-│   ├── topology_recognition.py
-│   ├── interactors.py
-│   ├── contacts.py         contact computation + matrices
-│   ├── network.py          PSN construction + PyMOL
-│   └── compare_variants.py ClinVar ranking of network metrics (experimental)
-├── utils/                  per-stage helper functions
-└── resources/              bundled lookup tables (e.g. sol.csv)
+mypsns network --config example_config.yaml
 ```
 
-### Modules
+### When topology recognition stops
 
-- **`cli.py`** — application entry point.
-  Configures automatically CLI reading function's parameter names and types (no argparse)
-  callback: runs first, reads the global flags (-v, -q, --log-file) and configures logging
-  Calls specific commands found in commands/*_cmd.py (through app.command).
+`topology` only accepts a forcefield entry whose atom names match the
+structure's exactly, and stops the pipeline otherwise. To see it, rename every
+glycine `HA1` to `HA3` in a copy of the test structure:
 
-- **`config.py`**
-  source of truth for what parameters the pipeline accepts, what their types are, what their defaults are, and what constraints apply.
-  Any invalid value is caught HERE, before any pipeline code runs.
-
-  Defines global DEFAULT_NA_VALUES (for pandas.read_csv, omitting NA to preserve sodium atom names) and a Pydantic model for each of the main modules.
-
-  Orchestrates whole application setup (flags > .yml > defaults) and writes complete yaml file.
-  Also holds `NAMED_INTERACTOR_DEFAULTS` — the PyInteraph-matching `named_interactors` rule
-  set used as the default for `InteractorsConfig.named_interactors_rules`. It is the only
-  copy: `utils/interactors_utilities.py` imports it, and
-  `tests/test_named_interactor_defaults.py` checks that no second copy appears.
-
-## Services
-
-The `mypsns/services/` folder holds the modules that drive the pipeline.
-Expected execution order:
-
-1. `ff_reader` — parse the GROMACS forcefield
-2. `topology_recognition` — match topology residues to forcefield entries
-3. `interactors` — reconstruct whole-system topology + assign interaction roles
-4. `contacts` — compute contacts over a trajectory and build matrices
-5. `network` — build residue-interaction networks (standalone; run after `contacts`)
-6. `compare_variants` — rank network metrics against ClinVar (experimental; `mypsns compare-variants`)
-
-Stages 1–4 are chained by `mypsns run`; `network` is invoked separately.
-
-A note on `na_values`: every stage accepts an optional `na_values` list that is
-forwarded to every `pandas.read_csv`. The shared default deliberately **excludes
-`"NA"`** so sodium atoms/residues named `NA` are not parsed as missing. There is
-no `main.py`; the entry point is the `mypsns` console script (`mypsns/cli.py`),
-and per-stage options are set via the config file or CLI flags.
-
----
-
-### `ff_reader.py`
-
-GROMACS forcefield parser.
-
-**Parameters**
-- required:
-  - `inpath`: forcefield folder (the `.ff` directory)
-  - `outpath`: destination folder (e.g. `charmm36_apr2019_vm` from `charmm36-apr2019_vm.ff`)
-- optional:
-  - `na_values`: NA-string list (see note above)
-  - `nonbonded_name` (default `"ffnonbonded.itp"`): file holding nonbonded parameters
-  - `additional_residues` (default `True`): merge extra residues bundled in `resources/`
-
-**What it does**
-
-1. Reads every residue defined in the `.rtp` files. Per atom it records
-   `rtp_file`, `resname`, `atom_name`, `atom_type`, `charge`, `chargegroup`
-   (integer grouping whose total charge sums to an integer — a GROMACS device
-   for Coulomb cutoffs when PME is off), and from `ffnonbonded.itp` the
-   `sigma`, `epsilon`, and `mass`.
-2. Reads termini definitions from `.n.tdb` / `.c.tdb`. **`.rtp` and `.tdb`
-   names must correspond** (e.g. `merged.rtp` ↔ `merged.n.tdb` / `merged.c.tdb`).
-   Bond-entry conventions: atoms prefixed `-` (present in every bond entry of a
-   terminus) are **found and removed** from the residue; atoms prefixed `r` are
-   **found and replaced** with the terminus-defined atom, bonds adjusted.
-3. Reads σ and ε from the `.itp` named by `nonbonded_name`.
-4. Writes `final_ff_residues.csv` (`residues.csv` ⋈ `atomtypes_se.csv` on
-   `atom_type`, adding `mass`, `sigma`, `epsilon`) and `final_ff_ters.csv`
-   (the ters table, similarly joined). `atomtypes_se.csv` (atom type → σ, ε) is
-   also produced and is later consumed by `contacts` for energy calculations.
-   The `mass` column here is the **forcefield mass**, later reused by `contacts`
-   for hydrophobic-cluster centres of mass (see *Interactor roles*).
-
-**Expected inputs**: `*.rtp`, `*.tdb` (`.n.tdb` / `.c.tdb`, names matched to the
-`.rtp`), and the nonbonded `.itp`.
-
----
-
-### `topology_recognition.py`
-
-Matches each residue in the input topology to a forcefield entry from
-`ff_reader`. The same residue name appearing with different atom sets
-(e.g. terminal vs internal) is treated as distinct residue topologies.
-
-**Parameters**
-- required: `topology` (PDB/GRO/…), `outpath`, `ff_path` (the `ff_reader` output)
-- optional: `na_values`
-
-The constructor calls `parse_initial_topology_info`, writing
-`initial_topology_info.csv` — a per-atom table with whichever of `chainID`,
-`resindex`, `resid`, `resname`, `index`, `id`, `name`, `type`, `element`,
-`mass`, `charge` the topology format supports (columns that raise
-`NoDataError` for every atom are omitted). Special case: if the format supplies
-`type` but not `element` and the longest type string is ≤2 chars, `type` is
-copied into `element` (handles PDBs where atomic symbols land in the type column).
-
-**Methods**
-
-- `get_restypes(verbose=False)` — group atoms into unique residue topologies by
-  exact atom-name set. Writes `<outpath>/resid_topologies/<resname>[_<n>]_rixs.txt`
-  (Resindex lists) and `<resname>[_<n>]_atoms.csv` (atom names + masses), plus
-  `different_residue_topologies.csv` indexing them. The `_<n>` suffix is dropped
-  for the first variant of a resname (`ALA_atoms.csv`, then `ALA_1_atoms.csv`, …).
-- `get_ff_parameters(verbose=False, maxToCheck=-1)` — associate each topology
-  residue with a forcefield entry. Candidates are sorted by name similarity
-  (`difflib.SequenceMatcher`); `maxToCheck` caps how many are inspected
-  (`-1` = all). Two passes: (1) exact atom-name-set match for candidates with the
-  right atom count; (2) on failure, apply each `.tdb` ter substitution and
-  re-check. Outcomes split into `found_residues` (exact, with/without ter subs)
-  and `best_choices` (ranked by atom overlap, then mass agreement on unmatched
-  atoms). Writes `found_topologies/<resname>_ff_atoms.csv` for matches,
-  `possible_topologies/<resname>_uncertain_atoms_<n>.csv` for candidates, and
-  `complete_residue_topologies.csv` (or `unmatching_residue_topologies.csv` if
-  any residue is unmatched). Only the outcome of the current run is kept: a
-  `complete_…` or `unmatching_…` file left by an earlier run is removed.
-
-  If **any** residue topology is left unmatched, the stage logs which residues
-  failed (and how many atom names the best candidate shares with the structure)
-  and raises `TopologyAssociationError`, halting the pipeline before
-  `interactors` (which would otherwise fail later with a confusing missing-file
-  error). The message prints the `mypsns accept-topology` commands that resolve
-  it: see [Unmatched residues](#unmatched-residues-mypsns-accept-topology).
-
-  > Non-standard residues (e.g. N-myristoylated Gly `GLM`, a metal ion `CAL`)
-  > must have a forcefield entry to be matched. If recognition fails for one,
-  > raise `--max-to-check` toward `-1` (inspect every ff entry) — large custom
-  > residues can sort far down the name-similarity list.
-
-#### Unmatched residues: `mypsns accept-topology`
-
-Recognition only accepts a forcefield entry whose atom names match the
-structure's **exactly**. A residue that differs by a few names (a hydrogen
-naming convention, an N-terminus written as `HT1–HT3` while the forcefield's
-`NH3+` patch calls them `H1–H3`) halts the stage, and recognition writes the
-closest forcefield entries to `possible_topologies/` as candidates.
-`accept-topology` promotes the candidate you choose, so the pipeline can continue.
-The fix in the forcefield or the structure (option 2 in the error message) is
-still the cleaner one when it is possible.
-
-The topology names used below (`MET`, `GLY`, `MET_1`, …) are the residue
-topology names from the error message: the resname, plus `_<n>` for its
-second, third, … atom set (e.g. a terminal copy of the residue).
-
-**1. Recognition halts.** `mypsns topology` (or `mypsns run`) stops with a
-`TopologyAssociationError` that lists each unmatched topology, how many atom
-names its best candidate shares with the structure, and the commands for the
-next steps:
+```bash
+sed -E 's/^(.{5}GLY  )  HA1/\1  HA3/' $D/structures/sim.prot.gro > /tmp/gly_ha3.gro
+OUT2=/tmp/mypsns_halt
+mypsns run -t /tmp/gly_ha3.gro -x $D/structures/traj.xtc \
+           -ff $D/forcefields/charmm36-apr2019_vm.ff -o $OUT2 --nc 4      # stops, exit code 1
+```
 
 ```text
 Topology recognition could not associate 1 residue topology/ies to the forcefield:
-  - MET (topology MET): no exact match; the best of 4 candidate(s) shares 16/19 atom names
+  - GLY (topology GLY): no exact match; the best of 14 candidate(s) shares 6/7 atom names
 ...
   1. promote a candidate. List the candidates and how their atoms pair with the structure's:
-       mypsns accept-topology -o run/
+       mypsns accept-topology -o /tmp/mypsns_halt
      then accept one per topology (by index, or a hand-edited CSV path):
-       mypsns accept-topology -o run/ MET=0
+       mypsns accept-topology -o /tmp/mypsns_halt GLY=0
+  2. add the missing residue(s) to the forcefield, or correct the structure's atom names,
+     and re-run `mypsns topology --overwrite`.
 ```
 
-> **[Screenshot 1 — to add]** the halted `mypsns topology` run in the terminal,
-> showing the unmatched residue and the suggested `accept-topology` commands.
-> Suggested file: `docs/img/accept-topology-1-halt.png`.
-
-**2. List the candidates.** Run the command without choices:
+List the candidates, check one, accept it, and continue:
 
 ```bash
-mypsns accept-topology -o run/
+mypsns accept-topology -o $OUT2                    # candidates and their renames
+mypsns accept-topology -o $OUT2 GLY=0 --dry-run    # what would change; writes nothing
+mypsns accept-topology -o $OUT2 GLY=0
+mypsns run -t /tmp/gly_ha3.gro -x $D/structures/traj.xtc \
+           -ff $D/forcefields/charmm36-apr2019_vm.ff -o $OUT2 --nc 4      # skips the finished stages
 ```
 
 ```text
-             MET  (MET, 2 residue(s)) — unresolved
-┏━━━┳━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
-┃ # ┃ forcefield residue(s) ┃ renames (forcefield → structure) ┃
-┡━━━╇━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┩
-│ 0 │ GLY-NH3+, MET         │ H1→HT1, H2→HT2, H3→HT3           │
-│ 1 │ NH3+, MET             │ H1→HT1, H2→HT2, H3→HT3           │
-│ 2 │ GLY-NH3+, DMET        │ H1→HT1, H2→HT2, H3→HT3           │
-│ 3 │ NH3+, DMET            │ H1→HT1, H2→HT2, H3→HT3           │
-└───┴───────────────────────┴──────────────────────────────────┘
+              GLY  (GLY, 6 residue(s)) — unresolved
+┃ #  ┃ forcefield residue(s) ┃ renames (forcefield → structure) ┃
+│ 0  │ GLY                   │ HA1→HA3                          │
+│ 1  │ DGLY                  │ HA1→HA3                          │
+│ 2  │ GLY                   │ identical to #0                  │
+...
 ```
 
-Each row is one file, `possible_topologies/<topology>_uncertain_atoms_<#>.csv`:
+The contacts of this run equal those of the unmodified one. Choosing a
+candidate, hand-editing one and what acceptance writes are described under
+[`accept-topology`](#mypsns-accept-topology).
 
-- **forcefield residue(s)**: the forcefield entries the candidate is built
-  from, i.e. the residue and the terminal patch applied to it. **This is what
-  you choose on.** Here the structure residue is an N-terminal L-Met, so #1 (the
-  generic `NH3+` patch on `MET`) is right; #0 uses the glycine N-terminal patch
-  (different charges on CA/HA) and #2/#3 are D-Met.
-- **renames**: atoms whose names differ, paired with the structure's atoms the
-  way recognition scored the candidate. Atoms with the same name pair with each
-  other, and the rest pair in file order. A red `!` marks a pair whose masses
-  differ: that pairing is wrong and the candidate needs a hand-edited copy
-  (step 4).
-- `identical to #n` marks a candidate whose file is identical to an earlier
-  one. Recognition often proposes the same topology several times (one unpatched
-  copy for each terminal patch that does not apply), so skip those.
-- A topology with no candidate at all (none of the forcefield entries inspected
-  has its atom count) can only be resolved with a CSV you write (step 4), unless
-  raising `--max-to-check` toward `-1` and re-running `topology --overwrite`
-  finds one.
+### Ranking network metrics against ClinVar (experimental)
 
-To inspect a candidate in full (atom types, charges, bonds), open its CSV.
-
-> **[Screenshot 2 — to add]** the candidate table from `mypsns accept-topology -o run/`,
-> and next to it the chosen `possible_topologies/MET_uncertain_atoms_1.csv`
-> opened in a spreadsheet. Suggested file: `docs/img/accept-topology-2-candidates.png`.
-
-**3. Accept one candidate per topology.** Check with `--dry-run` first, then apply:
+For a human protein, `compare-variants` asks ClinVar for the gene's missense
+variants and ranks every network metric by how well it separates pathogenic
+sites from the rest (AUROC, AUPRC, Mann–Whitney). It needs internet access and
+the `variants` extra. The test case is a yeast protein, so this example uses a
+recoverin–GRK1 run:
 
 ```bash
-mypsns accept-topology -o run/ MET=1 --dry-run   # shows the renames, writes nothing
-mypsns accept-topology -o run/ MET=1             # several at once: MET=1 GLY_1=0 …
+mypsns compare-variants --config <outpath>/run_config.yaml --gene RCVRN --reference NP_002894.1
 ```
 
-For each choice this:
+See [`compare-variants`](#mypsns-compare-variants-experimental).
 
-1. copies the candidate to `found_topologies/<topology>_ff_atoms.csv`, renaming
-   its differently named atoms to the structure's names (`H1→HT1`, …) in
-   `atom_name` **and** in the `bonds` lists. Contacts later joins this table
-   with the structure on atom names, so the forcefield names must not survive;
-2. fills that row's `ff_atoms` in `unmatching_residue_topologies.csv` and records
-   the source in a new `accepted_from` column;
-3. once **every** row has `ff_atoms`, writes `complete_residue_topologies.csv`,
-   the file `interactors` reads.
+## Your own system
 
-All choices are checked before anything is written. If one is invalid (unknown
-topology, missing candidate, atoms that cannot be paired), nothing changes and
-every problem is listed. Each run is logged to
+**Inputs.**
+
+- **Forcefield:** a GROMACS `.ff` folder. ff-reader reads every `*.rtp`, the
+  terminal databases `*.n.tdb` / `*.c.tdb` (named like the `.rtp`, e.g.
+  `merged.rtp` ↔ `merged.n.tdb`), and the nonbonded `.itp`
+  (`ffnonbonded.itp`). `mypsns guess_ff --parent <dir>` lists the forcefield
+  folders under a directory.
+- **Structure:** PDB or GRO with the forcefield's residue and atom names. Every
+  residue needs a forcefield entry, terminal patches included; non-standard
+  residues (a lipidated Gly, an ion) need theirs in the forcefield.
+- **Trajectory:** any format MDAnalysis reads, with the structure's atoms in the
+  same order.
+
+**Configuration.** Every setting has a default (`mypsns <command> --help`) and
+can be set in a YAML file (`--config`, see `example_config.yaml`) or as a flag.
+Flags override the file. Each stage records the settings it used in its section
+of `<outpath>/run_config.yaml`, leaving the other sections as they are, so the
+file always describes the whole run and can be passed back with `--config`.
+Paths are stored as given, so a relative path only resolves from the same
+working directory. `mypsns validate --config <file> --deep` checks a config,
+its files and that MDAnalysis can open them.
+
+**Re-running.** A stage skips when its output exists: `mypsns run` resumes after
+the last finished stage. `--overwrite` recomputes. Interaction roles are written
+by `interactors`, so after changing the interactor rules or options run
+`mypsns interactors --overwrite`, then `mypsns contacts --overwrite`.
+
+**Choosing a cutoff.** `Adjacency/<scheme>/graph_report/` scans the persistency
+threshold for every combination of contact types (largest connected component,
+degree distribution); its elbow plots help choose `network --min-persistency`.
+
+**Non-standard residues, ions, lipids.** Roles come from name-based rules: add a
+rule for the residue (see [Interactor rules](#interactor-rules), with a
+myristoylated glycine and a Ca²⁺ example).
+
+**Run time.** ff-reader takes ~3 min for CHARMM36. Contacts scale with frames ×
+atoms, and H-bonds dominate: 151 frames of the test case take ~20 s at
+`--nc 4`, 20 001 frames of a 219-residue complex ~55 min. Raise `--nc` on a
+larger machine; `--beg-frm`/`--end-frm` restrict the frames.
+
+## Command reference
+
+`mypsns --help` lists the commands; `mypsns <command> --help` lists every flag.
+
+| Command | Does |
+|---|---|
+| `run` | ff-reader → topology → interactors → contacts |
+| `ff-reader` | parse a GROMACS forcefield folder |
+| `topology` | match every residue of the structure to a forcefield entry |
+| `accept-topology` | promote a candidate for residues `topology` could not match |
+| `interactors` | give every atom its interaction roles |
+| `contacts` | per-frame contacts over the trajectory → matrices |
+| `network` | graphs, centralities, communities, PyMOL scripts |
+| `compare` | compare residue matrices with reference graphs (PyInteraph) |
+| `compare-variants` | rank network metrics against ClinVar (experimental) |
+| `validate` | check a config and the files it names |
+| `report` | summarise what a run folder contains |
+| `guess_ff` | find forcefield folders under a directory |
+
+**Common behaviour.** Global flags go before the command: `-vv` (debug log),
+`-q` (warnings only), `--log-file <file>` (debug log to a file), `--version`.
+The stage commands (`run`, `ff-reader`, `topology`, `interactors`, `contacts`,
+`network`) take `--config`, `--dry-run` (validate and print the plan),
+`--overwrite` and, except `ff-reader`, `--resume`; `-t/--topology`,
+`-x/--trajectory`, `-ff/--forcefield` and `-o/--outpath` set the paths where
+the stage needs them. Exit
+codes: 0 success, 1 failure (including a topology halt and a failed `compare`),
+2 invalid configuration or missing input, 3 missing optional dependency.
+
+### `mypsns run`
+
+Runs the four contact stages, skipping those already done. Only the flags below
+exist; every other setting comes from `--config`.
+
+| Flag | Meaning |
+|---|---|
+| `--config`, `-t`, `-x`, `-ff`, `-o` | config file and paths |
+| `--nc` | worker processes for contacts |
+| `--target` | contact types: `HBonds`, `Salt_bridges`, `HCs` (repeatable) |
+| `--only` / `--skip` | run only / skip these stages: `ff-reader`, `topology`, `interactors`, `contacts` (repeatable) |
+| `--resume` / `--overwrite` / `--dry-run` | skip finished stages (the default) / recompute everything / plan only |
+
+### `mypsns ff-reader`
+
+Parses the forcefield into `<outpath>/forcefield/`: `final_ff_residues.csv`
+(one row per atom of every residue: `rtp_file, resname, atom_name, atom_type,
+charge, chargegroup, bonds, sigma, epsilon, mass`), `final_ff_ters.csv` (the
+terminal patches: `tdb_file` instead of `rtp_file`, and the patch instructions
+in `bonds`) and `atomtypes_se.csv` (mass, σ, ε per atom type, for energies).
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--nonbonded-name` | `ffnonbonded.itp` | `.itp` with atom types, masses, σ/ε |
+| `--no-additional-residues` | off | do not add the residues bundled in `mypsns/resources/` |
+
+### `mypsns topology`
+
+Groups the structure's residues by atom-name set and matches each group to a
+forcefield entry, applying terminal patches where needed. `-ff` takes the
+original `.ff` folder (parsed first) or an already parsed `forcefield/` folder.
+Writes `<outpath>/Topology_recognition/`. If any residue has no exact match it
+stops with exit code 1 and prints the [`accept-topology`](#mypsns-accept-topology)
+commands that resolve it.
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--max-to-check` | 30 | forcefield entries tried per residue, most similar names first; `-1` = all. Raise it for large custom residues. |
+
+### `mypsns accept-topology`
+
+Resolves residues that `topology` could not match. Without choices it lists,
+per unmatched residue topology, the candidates recognition wrote to
+`Topology_recognition/possible_topologies/` and how their atoms pair with the
+structure's; with `TOPOLOGY=CHOICE` arguments it promotes them.
+
+| Argument / flag | Default | Meaning |
+|---|---|---|
+| `TOPOLOGY=CHOICE` (repeatable) | — | `CHOICE` is a candidate index (`possible_topologies/<TOPOLOGY>_uncertain_atoms_<CHOICE>.csv`) or the path of a CSV |
+| `-o` / `--outpath` | — | run folder |
+| `--config` | — | only `outpath` and `topology_recognition.na_values` are used; `-o` wins |
+| `--dry-run` | off | check the choices and show the renames; write nothing |
+
+**Choosing.** `TOPOLOGY` is the name in the halt message: the residue name, plus
+`_<n>` for its second, third… atom set (e.g. a terminal copy). In the candidate
+table, *forcefield residue(s)* are the entries the candidate is built from, the
+residue and the terminal patch applied to it: choose on that (an N-terminal
+L-Met wants `NH3+, MET`, not `GLY-NH3+` or `DMET`). *renames* pairs the atoms
+whose names differ, in file order after identical names pair up. A red `!`
+marks a pair of different masses: that pairing is wrong and needs a hand-edited
+copy. `identical to #n` marks a duplicate file; skip it. A topology with no
+candidate (no forcefield entry with its atom count) needs a CSV you write, or a
+larger `--max-to-check` and `topology --overwrite`.
+
+**What acceptance writes.** For each choice it copies the candidate to
+`found_topologies/<topology>_ff_atoms.csv` and fills its `structure_atom_name`
+column with the structure's names (`atom_name` and `bonds` keep the
+forcefield's; `interactors` renames them), records the source in
+`unmatching_residue_topologies.csv`, and once every row is resolved writes
+`complete_residue_topologies.csv`, which `interactors` reads. All choices are
+checked before anything is written; each run is logged to
 `Topology_recognition/accept_topology.log`.
 
-> **[Screenshot 3 — to add]** the "Accepted" table and the
-> "every residue topology resolved" line. Suggested file:
-> `docs/img/accept-topology-3-accepted.png`.
-
-**4. Hand-edited candidate (when no candidate fits as is).** Copy the closest
-candidate (or any topology CSV with the same columns), edit it, and pass its
-path instead of an index:
+**Hand-edited candidate.** Copy the closest candidate, edit it, pass its path:
 
 ```bash
-cp run/Topology_recognition/possible_topologies/MET_uncertain_atoms_1.csv met_fixed.csv
-# edit met_fixed.csv: atom_name must use the structure's names, and every
-# bonds entry that names a renamed atom must be updated too
-mypsns accept-topology -o run/ MET=met_fixed.csv
+cp $OUT2/Topology_recognition/possible_topologies/GLY_uncertain_atoms_0.csv gly_fixed.csv
+# edit atom_name (the structure's names are simplest) and every bonds entry naming a renamed atom
+mypsns accept-topology -o $OUT2 GLY=gly_fixed.csv
 ```
 
-The file must keep all ten columns (`rtp_file, resname, atom_name, atom_type,
-charge, chargegroup, bonds, sigma, epsilon, mass`). A `bonds` entry that names
-an atom the residue does not have raises a warning: usually `atom_name` was
-edited but `bonds` was not. (`-X` / `+X` entries name atoms of the previous / next
-residue and are not checked.)
+The file keeps all ten columns (`rtp_file, resname, atom_name, atom_type,
+charge, chargegroup, bonds, sigma, epsilon, mass`). A `bonds` entry naming an
+atom the residue lacks raises a warning (`-X`/`+X` name the previous/next
+residue and are not checked).
 
-> **[Screenshot 4 — to add]** `met_fixed.csv` in a spreadsheet with the edited
-> `atom_name` / `bonds` cells highlighted. Suggested file:
-> `docs/img/accept-topology-4-hand-edit.png`.
+**Things to know.** `topology --overwrite` discards acceptances (accept again).
+From `interactors` on, the residue's atoms carry the structure's names and the
+name-based rules see those: a name a rule treats specially (the HC rule excludes
+the AMBER amide `H` but keeps the CHARMM `HN`) changes the residue's roles.
+After changing an earlier choice, run `interactors --overwrite` and
+`contacts --overwrite`.
 
-**5. Continue the pipeline.**
+### `mypsns interactors`
 
-```bash
-mypsns interactors --config run.yaml   # then: mypsns contacts --config run.yaml
-# or: mypsns run --config run.yaml     (skips topology: complete_residue_topologies.csv exists)
+Rebuilds the whole system from the matched residues (chains, polymer bonds,
+terminal charge groups), groups residues into unique chemical variants and
+gives every atom its roles under two schemes: `named_interactors`
+(PyInteraph-compatible, name-based, the default) and `q_interactors`
+(charge/connectivity-based). Both role columns are always written to
+`<outpath>/Interactors/`. See [Interactor rules](#interactor-rules).
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `-m` / `--mode` | `named_interactors` | scheme(s) recorded in the config |
+| `--min-residue-charge` | 0.8 e | named: net charge a `Basic`/`Acidic` group needs; 0 = off |
+| `--max-da-charge` | −0.3 e | q: max (least negative) charge of an H-bond donor/acceptor |
+| `--min-h-charge` | 0.3 e | q: min charge of an H-bond hydrogen |
+| `--da-masses` | 14 16 19 | q: rounded masses of donor/acceptor elements (repeatable; replaces the default) |
+| `--min-abs-charge` | 0.75 e | q: min \|local charge\| of an `Acidic`/`Basic` group |
+| `--max-abs-charge` | 0.27 e | q: max \|charge\| of an HC atom |
+| `--max-num-heavy-ats` / `--min-num-heavy-ats` | 3 / 2 | q: heavy atoms per HC cluster (the minimum is soft) |
+| `--min-bonds-to-charged` / `--min-bonds-to-polar` | 3 / 1 | q: an HC atom is more than this many bonds from a charged / polar heavy atom |
+
+Custom `named_interactors_rules` are set in the YAML only.
+
+### `mypsns contacts`
+
+Finds the contacts in every frame for each interactor scheme and builds the
+matrices. Reads `<outpath>/Interactors/`, writes `<outpath>/Adjacency/`.
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--nc` | 2 | worker processes |
+| `--ram-thresh` | 80 | % of RAM at which H-bond batches stop growing |
+| `--nframes` | 500 | initial H-bond batch, frames |
+| `--beg-frm` / `--end-frm` | 0 / −1 | first / last frame, both inclusive (−1 = last) |
+| `--interactors-type` | `q_interactors`, `named_interactors` | role schemes, one output folder each |
+| `--target` | `HBonds`, `Salt_bridges`, `HCs` | contact types |
+| `--subject-chain` / `--surrounding-chain` | polymer chains / all chains | contacts are computed within each subject chain and between it and every surrounding chain |
+| `--d-a-dist` | 4.5 Å | H-bond donor–acceptor distance |
+| `--angle` | 120° | H-bond D–H–A angle, kept when ≥ |
+| `--d-h-cutoff` | 1.4 Å | donor–hydrogen pairing distance (MDAnalysis' 1.2 Å misses Cys S–H, 1.32 Å) |
+| `--sb-cutoff` | 4.5 Å | salt bridge: any atom pair of the two charged groups |
+| `--hc-cutoff` | 5.0 Å | hydrophobic: side-chain centres of mass |
+| `--matrix-type` | `persistency`, `energy` | matrices to build |
+| `--energy-use-abs` | off | threshold scans of energies use \|E\| instead of attractive-only max(0, −E) |
+| `--thr-step` | 0.1 | step (%) of the threshold scans |
+
+The cutoffs are PyInteraph 1's and apply to both schemes.
+
+```
+<outpath>/Adjacency/
+├── Contacts.log
+├── <name>_correct.pdb                      the structure with residue index as resid
+└── <scheme>/                               named_interactors/, q_interactors/
+    ├── Salt_bridges/  H_bonds/  HCs/       per-frame contacts of each chain pair:
+    │                                       *_upto_<frame>.csv, *_merged.csv, *_energy.csv
+    ├── {SB,Hbonds,HC}_final.csv            res_1, res_2, n_frames_contact, mean_dist, chains, labels
+    ├── {SB,Hbonds,HC}_final_visited_frames.csv   the frames of every pair
+    ├── adjacency_labels.dat                matrix row order
+    ├── {SB,Hbonds,HC}_adjacency.dat        persistency, % of frames
+    ├── combined_adjacency.dat              % of frames with any contact type
+    ├── {SB,Hbonds,HC}_{LJ,Coulomb,total}_energy.dat   mean energy per frame, kJ/mol
+    ├── all_total_energy.dat                sum over types
+    ├── graph_report/                       persistency threshold scans (csvs/, plots/)
+    └── energy_graph_report/                the same for energies
 ```
 
-If `Interactors/` already had outputs (you changed an earlier choice), re-run
-`mypsns interactors --overwrite` and then `mypsns contacts --overwrite`.
+### `mypsns network`
 
-| Argument / option | Default | Meaning
-|-------------------|---------|--------
-| `TOPOLOGY=CHOICE` (repeatable) | — | `CHOICE` is a candidate index (`possible_topologies/<TOPOLOGY>_uncertain_atoms_<CHOICE>.csv`) or the path of a CSV. No choices: list the unresolved topologies and their candidates.
-| `-o` / `--outpath` | — | Run folder (contains `Topology_recognition/`).
-| `--config` | — | YAML config. Only `outpath` and `topology_recognition.na_values` are used; `-o` wins.
-| `--dry-run` | off | Check the choices and show the renames; write nothing.
+Builds graphs from `Adjacency/` and writes `<outpath>/Network/`. Run it after
+`contacts`; `mypsns run` does not include it.
 
-Things to know:
+| Flag | Default | Meaning |
+|---|---|---|
+| `--interactors-type` | `q_interactors`, `named_interactors` | schemes to read |
+| `--target` | `HBonds`, `Salt_bridges`, `HCs` | contact types combined into each graph |
+| `--edge-weight-source` | `persistency`, `energy` | one graph per source |
+| `--weighting` | `both` | `weighted` (weight = value), `unweighted` (weight 1), or `both` |
+| `--min-persistency` / `--min-energy` | 0 / 0 | keep edges whose value is > this (%, energy as % of the strongest edge) |
+| `--min-degree` | 0 | drop nodes below this degree |
+| `--energy-use-abs` / `--no-energy-use-abs` | off | energy weight \|E\| instead of attractive-only max(0, −E) |
+| `--node-metric` | `betweenness_centrality` | also `degree`, `weighted_degree`, `degree_centrality`, `closeness_centrality`; one `.pml` each (repeatable) |
+| `--community` | `louvain` | also `greedy_modularity`, `label_propagation`, `connected_components` (repeatable) |
+| `--community-seed` | 42 | seed of the stochastic methods |
+| `--community-min-members` | 2 | smaller communities dissolve (members not drawn) |
+| `--sphere-scale` / `--stick-scale` | 2.0 / 0.5 Å | PyMOL: largest sphere / edge radius |
+| `--reference-pdb` | contacts' corrected PDB | structure the `.pml` scripts load |
+| `--write-matrices` / `--write-graphml` / `--shortest-paths` | on / off / off | extra outputs |
+| `--window-size` / `--window-stride` | — / = size | also build one energy network per frame window and track communities |
+| `--frame-start` / `--frame-stop` | — | use only frames in [start, stop): graphs are rebuilt from the per-frame CSVs |
+| `-n` / `--n-frames` | — | informational, logged only |
 
-- **Re-running `topology --overwrite` discards acceptances.** Recognition rewrites
-  the tables and removes the `complete_residue_topologies.csv` that acceptance
-  wrote, so accept again.
-- **The interactor rules see the structure's atom names.** After acceptance the
-  residue's atoms carry the structure's names, and the `named_interactors` rules
-  are name-based. A name the rules treat specially changes the residue's roles:
-  for example the HC rule excludes the AMBER amide `H` from the side-chain CoM
-  but keeps the CHARMM `HN`. Check the residue's row in
-  `Interactors/found_topologies/<variant>.csv` after `interactors`.
-- **Validated end to end** on the PyInteraph test case: with every Gly `HA1`
-  renamed to `HA3` in the structure, recognition halts on GLY. After
-  `accept-topology GLY=0`, `interactors` and `contacts` give SB / HC / H-bond
-  adjacency and energy matrices byte-identical to the unmodified run.
+**Edge weights.** Persistency comes from `*_adjacency.dat`; energy from
+`*_total_energy.dat`, mapped to max(0, −E) (or \|E\|) and normalised to % of the
+strongest edge. Several targets combine into one matrix per source:
+
+| | combined value | weighted graph | unweighted graph |
+|---|---|---|---|
+| persistency | element-wise **max** over targets (≤ 100 %) | value, if `> --min-persistency` | 1, if `> --min-persistency` |
+| energy | **sum** of the per-target weights, as % of the strongest | value, if `> --min-energy` | 1, if `> --min-energy` |
+
+Both weightings keep the same edges. The unweighted persistency graph is the
+analogue of PyInteraph's macro-IIN (`filter_graph -d hb -d hc -d sb -t <cutoff>`,
+which also keeps values `>` the cutoff); fed PyInteraph's own graphs it
+reproduces a PyInteraph macro-IIN exactly.
+
+**PyMOL scripts.** Each `.pml` loads the reference structure as a grey cartoon,
+puts a sphere on every network residue (CA, or the centre of mass when there is
+none, e.g. an ion) and draws edges as sticks scaled by weight. In
+`node_metrics/` spheres scale with the metric and edges are grey; in
+`community_metrics/` spheres and intra-community edges take the community's
+colour (16 colours, reused beyond 16) and edges between communities stay grey.
+
+**Time-resolved.** With `--window-size N` the per-frame energies are aggregated
+into windows of N frames, one graph is built per window and
+`time_resolved/community_evolution_<label>_<method>.csv`
+(`window_start, resindex, label, community`) tracks the communities.
+
+```
+<outpath>/Network/
+├── network.log
+└── <scheme>/
+    ├── csv/nodes_<label>_<method>.csv      centralities + community per residue
+    ├── csv/edges_<label>.csv
+    ├── csv/shortest_paths_<label>.csv      with --shortest-paths
+    ├── node_metrics/<label>_<metric>.pml
+    ├── community_metrics/<label>_<method>.pml
+    ├── matrices/                           with --write-matrices: adjacency_labels.dat,
+    │                                       <label>_network_adjacency.dat (final graph),
+    │                                       <label>_combined_adjacency.dat (before the threshold),
+    │                                       <label>_<target>_adjacency.dat (per target)
+    ├── network_<label>.graphml             with --write-graphml
+    └── time_resolved/                      with --window-size
+```
+
+### `mypsns compare`
+
+Compares residue × residue matrices type by type on the strict lower triangle
+(the diagonal is ignored: PyInteraph's `hb-graph.dat` keeps intra-residue
+H-bonds there). An edge is a value > 0; values closer than `--atol` count as
+equal; `% diff` is `100·Σ|C − T| / ΣT`.
+
+| Flag | Meaning |
+|---|---|
+| `--preset NAME` | a reference shipped in `tests/data/` (below): supplies the truth graphs and per-type tolerances |
+| `--truth-dir DIR` + `--truth-suffix S` | reference graphs named like PyInteraph: `{hb,hc,sb}-graph<S>.dat` |
+| `--computed-dir DIR` | a myPSNs `Adjacency/<scheme>/` folder |
+| `--truth TYPE=PATH` / `--computed TYPE=PATH` | any pair of matrices, matched by `TYPE` (repeatable) |
+| `--type` | compare only these types |
+| `--max-pct-diff TYPE=PCT` | exit 1 if a type exceeds PCT (overrides the preset's) |
+| `--atol` | default 0.01 |
+| `-o DIR` / `--labels FILE` | write `possible_sele_mismatch.csv` (edge in one matrix only), `possible_params_mismatch.csv` (both, values differ) and `comparison_summary.csv`; add residue labels from an `adjacency_labels.dat` |
+
+| Preset | Reference | Inputs shipped | Tolerances H-bonds / HC / SB |
+|---|---|---|---|
+| `pyinteraph_testcase` | PyInteraph 1 example, 149 residues, 151 frames | yes | 4.2 / 0.2 / 0.2 % |
+| `rec_grk1` | recoverin–GRK1, PyInteraph 1 run of 2018 on 1 µs (5 × 200 ns) | no (1.3 GB xtc) | 5.0 / 0.25 / 0.2 % |
+| `rec_grk1_r1` | the same run, replica r1 (frames 0–20000) | no | 5.0 / 0.2 / 0.2 % |
+
+Each preset has a `config.yaml` with the settings that reproduce it
+([Validation](#validation-against-pyinteraph-1)).
+
+### `mypsns compare-variants` (experimental)
+
+Ranks network metrics by how well they separate pathogenic missense sites of a
+human gene from the rest of the protein. Needs internet access and the
+`variants` extra (`requests`, `biopython`); without them it exits 3 with an
+install hint.
+
+1. **Rebuilds the graphs** from `Adjacency/` with the `network:` settings, by
+   the same code as `network`. With `--config` pointing at the
+   `run_config.yaml` that `network` wrote, it ranks exactly those graphs.
+   Centralities are computed in memory; `Network/<scheme>/csv/` is not touched.
+2. **Queries ClinVar** (`<gene>[gene]`, optionally narrowed to a GRCh38
+   `--chrom/--start/--stop` window) through NCBI E-utilities and keeps missense
+   records. A protein position is `non_benign` with at least one pathogenic or
+   likely-pathogenic record, `benign` with only benign ones, `vus` otherwise.
+3. **Maps positions** by aligning the RefSeq protein (global, BLOSUM62) to every
+   protein chain; the best chain above `--min-identity` is the gene's.
+4. **Scores each graph:** positives are the `non_benign` sites, negatives every
+   other aligned residue (`--negative rest`) or only `benign` sites
+   (`--negative benign`). Residues that do not align (partner chains, ions) are
+   not scored.
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--gene` | required | gene symbol queried in ClinVar |
+| `--reference` | required | RefSeq protein the ClinVar `p.` positions refer to (the NP_ of the NM_ in ClinVar titles, e.g. `NM_002903.3` → `NP_002894.1`), or a raw sequence |
+| `--chrom` / `--start` / `--stop` | — | optional GRCh38 window (all three or none) |
+| `--email` / `--api-key` | env `NCBI_EMAIL` / `NCBI_API_KEY` | NCBI contact and key (10 requests/s instead of 3); the key is never written to `run_config.yaml` |
+| `--negative` | `rest` | `rest` or `benign` |
+| `--min-identity` | 70 | % identity for a chain to count as the gene's |
+| `--interactors-type`, `--target`, `--edge-weight-source`, `--energy-use-abs`, `--weighting`, `--min-persistency`, `--min-energy`, `--min-degree`, `--frame-start`, `--frame-stop` | from `network:` | graph rebuild, as in `network` |
+| `--overwrite` / `--dry-run` | off | rewrite this gene's tables / plan only |
+
+```
+<outpath>/Network/
+├── compare_variants.log
+└── <scheme>/variants/
+    ├── <gene>_ranking_<label>.csv     per metric: auroc, auroc_oriented, direction, auprc, mwu_p, n_pos, n_neg
+    ├── <gene>_nodes_<label>.csv       per aligned residue: metrics, ref_pos, ref_aa, ClinVar label
+    ├── <gene>_clinvar_sites.csv       per missense site: counts, label, chain, resindex, resnum, structure vs reference aa
+    └── <gene>_clinvar_variants.csv    the raw ClinVar records (a dated snapshot: keep it with the results)
+```
+
+Notes: an empty ranking (header only, with a warning) means no pathogenic site
+falls on a modelled residue. RCVRN, for example, has 18 missense sites, none
+pathogenic. The GRCh38 window can drop records the gene query keeps (for RCVRN,
+one missense VUS with no position in the window); omit it when every record
+matters. `classify_significance` sends everything not pathogenic or benign to
+VUS, including conflicting classifications, `not provided` and empty values.
+Mismatches between `structure_aa` and `ref_aa` are expected for orthologues;
+many of them suggest the wrong reference isoform. From Python it is a `Network`
+subclass: `CompareVariants(...).load_static(...)`, then
+`rank_against_clinvar(gene=..., reference=...)` and `write_rankings(...)`.
+
+### `mypsns validate`, `report`, `guess_ff`
+
+- `mypsns validate --config FILE [--deep]`: schema, paths, forcefield content,
+  writable outpath; `--deep` also opens the structure and trajectory.
+- `mypsns report OUTPATH [--json]`: which stages finished, per scheme.
+- `mypsns guess_ff --parent DIR [--recursive-search] [--maximum-depth N]`:
+  folders under DIR that look like a GROMACS forcefield.
 
 ---
 
-### `interactors.py`
+# Part II — Developer guide
 
-Bridges `topology_recognition` and `contacts`: reconstructs full topology
-(chains, polymer back-bonds, ter chargegroups), deduplicates residues into
-unique chemical variants, and assigns interaction roles.
+## Repository layout
 
-**Parameters**
-- required: `topology` (same file as the rest of the pipeline);
-  `general_outpath` (must already contain `Topology_recognition/`)
-- optional: `na_values`; `outlog` (defaults to `general_outpath`)
+```
+mypsns/
+├── cli.py                    Typer app: global options, command registration, main()
+├── config.py                 Pydantic models per stage, defaults, YAML load/merge/dump
+├── logging_utils.py          Rich console, banners, summary tables
+├── commands/<name>_cmd.py    one module per command; _helpers.py shared by all
+├── services/                 stage logic, one class per stage (FFReader … Network, CompareVariants)
+├── utils/<stage>_utilities.py   helper functions (most of the code)
+└── resources/sol.csv         exact-match water table
+tests/                        pytest suite; tests/data/ = reference datasets (presets)
+example_config.yaml           every setting at its default, runnable on the test case
+CLAUDE.md                     notes for coding agents and the TODO list
+CHANGELOG.md                  changes that affect existing run folders
+```
 
-**Methods**
+## Architecture
 
-- `get_complete_topology()` — fills bidirectional bond info per residue type;
-  concatenates per-residue tables in memory; detects chain boundaries from
-  `+`-bond connectivity (polymers) and contiguous `rtp_file` runs (non-polymers);
-  stamps `Chain` and `Entity` (`P` polymer / `M` monomer); adds polymer
-  back-bonds (`-X` references); adjusts ter chargegroups for terminal polymer
-  residues; deduplicates residues by atom-level chemistry into unique variants.
-  Outputs to `<general_outpath>/Interactors/`:
-  - `found_topologies/<variant_id>.csv` — one CSV per unique residue chemistry
-    (`<resname>`, then `<resname>_2`, `<resname>_3`, … for subsequent variants).
-    Columns: `rtp_file, resname, atom_name, atom_type, charge, chargegroup, bonds, mass`
-    (interaction-role columns are appended later by `add_inttypes`).
-  - `residue_index.csv` — one row per residue instance:
-    `Resindex, resnum, Chain, Entity, variant_id, topology_resname`
-    (`topology_resname` is the residue's name in the **input topology**, e.g.
-    `HIS`, as opposed to the forcefield/rtp name carried by `variant_id`, e.g.
-    `HSE`; it is what selection strings prefer so they match the structure).
-  - `atom_index_map.csv` — one row per atom: `Resindex, atom_name, atom_index`.
-- `add_inttypes(**kwargs)` — appends interaction-role columns to each variant
-  CSV in place. Each variant is analysed in isolation; back-bonds remain in the
-  bonds strings but BFS terminates at the variant boundary.
-  - **`q_interactors`** (charge-based, PIE-style): H-bond `HAcc`/`HDon`/`HBond`
-    from partial charges + connectivity (`max_DA_charge`=−0.3, `min_H_charge`=0.3,
-    `DA_masses`=[14,16,19]); salt-bridge `Acidic`/`Basic` from recursive local
-    charge (`min_abs_charge`=0.75); `HC` flag + `HC_cluster` label for atoms with
-    `|charge| ≤ max_abs_charge` (0.27) and BFS distance `> min_bonds_to_charged`
-    (3) from any charged atom (`max_num_heavy_ats`=3, `min_bonds_to_polar`=1).
-  - **`named_interactors`** (PyInteraph-compatible, name-based; **default**):
-    roles assigned by AND-combined `(attribute, [values])` / `not <attribute>`
-    rules — see *Interactor roles & PyInteraph reproduction* for the grammar and
-    the default rule set. After role assignment, donor-bound H atoms are found by
-    walking from `HDon` atoms via the bonds column and tagged `HBond`; **their
-    `HC` tag is preserved** (the amide `HN` and Trp `HE1` are both H-bond
-    hydrogens and members of the hydrophobic side-chain CoM, as in PyInteraph).
-    The salt-bridge **charge gate** (`min_residue_charge`) is then applied to
-    `Basic`/`Acidic` groups.
+A command is a thin layer: its `*_cmd.py` collects the flags into a nested
+overrides dict, `build_pipeline_config` merges them over the YAML and the
+defaults (**flags > YAML > defaults**) and validates the result, the command
+prints a summary (or stops on `--dry-run`), checks whether the stage is already
+done, calls the service and records its section of `run_config.yaml`
+(`dump_run_config(cfg, outpath, sections=[...])`).
 
-  Note: at variant level there is no cross-residue context, so the previous
-  3-residue BFS widening for `q_interactors` HC classification no longer applies.
-  Differences are negligible for the standard amino-acid set, but verify HC
-  labels on a representative system if they look off.
+| Layer | Owns |
+|---|---|
+| `cli.py` | registration (`app.command(...)`), global flags, logging setup in the callback |
+| `config.py` | the parameters: one Pydantic model per stage (`FFReaderConfig`, `TopologyConfig`, `InteractorsConfig`, `ContactsConfig`, `NetworkConfig`, `CompareVariantsConfig`), composed in `PipelineConfig`. Every model is `extra="forbid"`, so a misspelt YAML key fails validation. The single copy of the default rules, `NAMED_INTERACTOR_DEFAULTS`. |
+| `commands/` | the only place that knows both the flags and the service signature |
+| `services/` | stage logic (`Topology_recognition`, `Interactors`, `Contacts`, `Network`, …) |
+| `utils/` | the per-stage functions the services call |
 
----
+Errors surface as one Rich line and an exit code (see the command reference);
+tracebacks appear with `-vv`.
 
-## Interactor roles & PyInteraph reproduction
+## Data flow and run folder
 
-The `named_interactors` scheme assigns each atom one or more **roles** that
-`contacts` turns into selections: `HC` (hydrophobic-cluster member),
-`HDon`/`HAcc` (H-bond donor/acceptor heavy atoms), `HBond` (a donor-bound H),
-`Basic`/`Acidic` (charged-group members). The default rule set reproduces
-PyInteraph 1's `hydrogen_bonds.ini` / `charged_groups.ini` / `hc_reslist`, so a
-run with **no extra config** matches PyInteraph 1 (SB ~0.07 %, HC ~0.11 %,
-H-bonds ~4.5 %).
+Every stage reads the previous stage's folder in `<outpath>` and writes its own.
 
-### Rule grammar
+**ff-reader** (`services/ff_reader.py`, `utils/ff_reader_utilities.py`) parses
+the `.rtp` residues (atom type, charge, charge group, bonds) and the `.tdb`
+terminal patches, joins σ, ε and mass from the nonbonded `.itp`, and writes
+`forcefield/final_ff_residues.csv`, `final_ff_ters.csv`, `atomtypes_se.csv`. In
+`final_ff_ters.csv` the `bonds` column also carries the patch instructions
+(`rX` replace, `-X` delete, `+X` an `[ add ]` control atom outside the patch);
+`is_patch_instruction` tells them from bonds. The masses here are the ones used
+later for hydrophobic centres of mass.
 
-`named_interactors_rules` maps each role to a **list of rules**. Within a rule
-all conditions hold (AND); across a role's rules any match qualifies (OR).
-Conditions are `attribute → value-list`; prefix an attribute with `not ` to
-negate.
+**topology** (`services/topology_recognition.py`) groups residues by atom-name
+set (`resid_topologies/<name>_rixs.txt`, `_atoms.csv`), then tries forcefield
+entries in order of name similarity (`--max-to-check`): an exact atom-name match
+first, then each terminal patch applied (`get_ter_ffres` replaces, renames,
+deletes and adds atoms in every bonds list). Matches go to
+`found_topologies/<topology>_ff_atoms.csv`, which keeps the forcefield names in
+`atom_name`/`bonds` and the structure's in `structure_atom_name`; the best
+non-matches go to `possible_topologies/`. It writes
+`complete_residue_topologies.csv`, or `unmatching_residue_topologies.csv` and
+raises `TopologyAssociationError`. A patch that leaves one of its atoms with no
+bond (a hand-made patch, usually) is reported as a warning. Topology keys come
+from `topology_key()`.
+
+**interactors** (`services/interactors.py`) renames atoms to the structure's
+names (`build_wholetop`), detects chains (polymers by `+` bonds, `Entity` P;
+other molecules by `rtp_file`, M), adds polymer bonds and terminal charge
+groups, and deduplicates residues into variants. It writes
+`Interactors/found_topologies/<variant>.csv` (`<resname>`, `<resname>_2`, …),
+`residue_index.csv` (`Resindex, resnum, Chain, Entity, variant_id,
+topology_resname`, the latter being the structure's name) and
+`atom_index_map.csv`. `add_inttypes` then appends the `q_interactors`,
+`HC_cluster` and `named_interactors` columns to every variant file.
+
+**contacts** (`services/contacts.py`, `utils/contacts_utilities.py`) rebuilds
+the per-atom table from those three files, writes the renumbered
+`<name>_correct.pdb`, builds compact MDAnalysis selections per chain and role,
+and dispatches per chain pair and contact type to `--nc` workers: salt bridges
+and HC by PBC-aware capped distances (HC centres of mass with forcefield
+masses), H-bonds by MDAnalysis `HydrogenBondAnalysis` in RAM-bounded batches.
+Workers stream `*_upto_<frame>.csv`, merged into `*_merged.csv` per chain pair.
+`build_results` aggregates them per contact type (by folder) into
+`*_final.csv`; then persistency matrices, energies (streamed per frame, constant
+memory) and threshold scans. Selections assume atom names are unique within a
+residue.
+
+**network** (`services/network.py`, `utils/network_utilities.py`,
+`utils/matrix_utilities.py`) combines the per-type matrices per source
+(`load_combined_per_type`: persistency by max, energy by sum), thresholds them,
+builds `networkx` graphs labelled `<source>` / `<source>_unweighted`, computes
+centralities and communities, writes CSVs, `.pml` scripts and matrices. With a
+frame range or windows it rebuilds from the per-frame CSVs instead.
+`CompareVariants(Network)` reuses `load_static`.
+
+**compare** (`utils/validation_utilities.py`) only reads matrices.
+
+## Extending myPSNs
+
+**An option.** (1) Add a `Field` to the stage's model in `config.py`, with its
+default and description: the model is the source of truth for type, default
+and constraints. (2) Add a `typer.Option(None, ...)` to the command, put it in
+the overrides dict, the `print_summary` block and the service call (and in
+`run_cmd.py` if `mypsns run` forwards it). (3) Document it in the command's
+table above, and add a test if it changes behaviour. A new `q_interactors`
+parameter also goes into `CHARGE_BASED_PARAMETERS`
+(`utils/interactors_utilities.py`); the tests check the tuple, the config and
+the forwarding.
+
+**A command.** Create `commands/<name>_cmd.py` with one function whose
+parameters are `typer.Option`s, import it in `commands/__init__.py` (`__all__`)
+and register it in `cli.py` with `app.command(name=..., help=...)`.
+
+**A pipeline stage.** Add its model to `PipelineConfig`, a service class, a
+command (which records its own section with `dump_run_config(...,
+sections=["<stage>"])` and skips when its output exists), a step in
+`run_cmd.py` if `run` chains it, a status check in `report_cmd.py`, and its
+reference section and run-folder layout in this README.
+
+## Interactor rules
+
+`named_interactors` gives each atom zero or more roles, which `contacts` turns
+into selections: `HC` (hydrophobic side chain), `HDon` / `HAcc` (H-bond donor /
+acceptor heavy atom), `HBond` (a donor-bound hydrogen), `Basic` / `Acidic`
+(charged-group member). The defaults reproduce PyInteraph 1's
+`hydrogen_bonds.ini`, `charged_groups.ini` and hydrophobic residue list:
 
 ```yaml
 interactors:
   named_interactors_rules:
     HC:
-    - resname: [ALA, VAL, LEU, ILE, PHE, PRO, TRP, MET]   # AND
-      not atom_name: [N, CA, C, O, H, H1, H2, H3, O1, O2, OXT]
+    - residue: [ALA, VAL, LEU, ILE, PHE, PRO, TRP, MET]
+      not atom_name: [N, CA, C, O, H, H1, H2, H3, O1, O2, OXT, OT1, OT2]
+    HDon:
+    - atom_name: [OH, OG, NE2, OG1, NE, N, ND1, NZ, NH1, NH2, OW, ND2, SG, OH2, NE1]
+    HAcc:
+    - atom_name: [OH, OG, OD1, OD2, OG1, O, ND1, NE2, OE2, OW, SG, OE1, OH2, SD]
     Basic:
+    - resname: [NH3+, GLY-NH3+, NHT3+, PRO-NH2+]
+      atom_name: [N, H1, H2, H3, HT1, HT2, HT3]
     - resname: [ARG]
       atom_name: [CD, NE, CZ, NH1, HH11, HH12, NH2, HH21, HH22]
-    - resname: [LYS, LYSH]                                  # OR (second rule)
+    - resname: [HIS, HSD, HSE, HSP, HSA, HSB, HIS1, HISH, HID, HIE, HIP]
+      atom_name: [CG, ND1, HD1, CD2, CE1, NE2, HE2]
+    - resname: [LYS, LYSH]
       atom_name: [CE, NZ, HZ1, HZ2, HZ3]
+    Acidic:
+    - resname: [ASP]
+      atom_name: [CG, OD1, OD2]
+    - resname: [GLU]
+      atom_name: [CD, OE1, OE2]
+    - resname: [COO-]
+      atom_name: [C, O1, O2, O, OXT, OT1, OT2]
+    hb_masses: [1]          # rounded mass of the hydrogens tagged HBond
 ```
 
-Supplying `named_interactors_rules` **fully replaces** the defaults (not merged),
-so copy the whole block and edit it. Roles are independent: an atom may be both
-`HC` and `HAcc` (Met `SD`, Trp `NE1`) or both `HC` and `HBond` (the backbone
-amide `HN`); each contact type filters on its own role, so there is no
-double-counting.
+**Grammar.** Each role has a list of rules; a rule holds when all its conditions
+hold (AND), a role when any rule holds (OR). A condition is
+`attribute: [values]`; `not attribute:` negates it. Attributes are columns of
+the per-residue tables: `atom_name`, `atom_type`, `resname` and `residue`.
+`resname` is the forcefield name of the atom's own entry, so the atoms a
+terminal patch adds or replaces carry the patch name (`NH3+`, `NH2`, `COO-`,
+`COOH`); `residue` is the residue the atom belongs to, patch atoms included.
+The HC rule uses `residue` because PyInteraph's side chain is every atom of the
+residue except its backbone list (above): a C-terminal Leu keeps the `HT2` of a
+COOH patch. The charged groups use `resname`, since there the patch is the
+group. A rule set in the YAML **replaces** the defaults (copy the whole block
+from any `run_config.yaml`), and changing it needs `interactors --overwrite`,
+then `contacts --overwrite`.
 
-### The salt-bridge charge gate
+**Charge gate.** `Basic`/`Acidic` rules propose groups; `--min-residue-charge`
+(0.8 e, 0 disables) keeps a group only if the forcefield net charge of its
+`(residue, resname)` group clears it with the right sign. Neutral His (HSE,
+HSD) is therefore dropped, protonated His (HSP) and Ca²⁺ (+2) pass. PyInteraph
+has no gate; turn it off to match a PyInteraph run that counted neutral groups
+(the `rec_grk1` preset does).
 
-`Basic`/`Acidic` rules tag *candidate* charged groups; the `--min-residue-charge`
-gate (default **0.8 e**, `0` disables) then keeps only groups whose net
-forcefield charge over the `(residue, forcefield-resname)` group clears the
-threshold. This makes salt bridges protonation-state–aware without per-residue
-hacks: neutral His (HSE/HSD, net ≈ 0) is filtered out while protonated His
-(HSP, +1) and metal cations (e.g. Ca²⁺, +2) pass.
+**Hydrophobic centres of mass** are weighted by forcefield masses (MDAnalysis
+guesses elements from names and turns `CAL` into carbon). An atom may hold
+several roles: the amide `HN` is `HC` and `HBond`, Met `SD` and Trp `NE1` are
+`HC` and acceptor/donor, as in PyInteraph.
 
-### Hydrophobic-cluster centres of mass
-
-HC contacts use the **centre of mass** (not geometry — geometry was tested and
-is worse) of the side-chain atoms, weighted by **forcefield masses** loaded from
-`Interactors/found_topologies/` (matching PyInteraph, and immune to MDAnalysis's
-element-from-name mis-guesses). The amide `HN` and polar side-chain atoms that
-are also donors/acceptors (`SD`, `NE1`, `HE1`) are **kept** in the COM, as
-PyInteraph does.
-
-### H-bonds are engine-limited
-
-myPSNs uses MDAnalysis `HydrogenBondAnalysis` (keeps a bond when the D–H–A angle
-is **≥** the cutoff; 180° = linear). PyInteraph 1 uses its own geometric test
-with a different angle convention and measures the H→acceptor distance (its
-3.5 Å ≈ 4.5 Å donor–acceptor here). With `angle 120` / `d_a 4.5` the **edge set**
-matches (≈279/282 on the test set); the residual ~4.5 % is mostly small per-frame
-persistence scatter (~1.8 pts/edge) from the different detectors, which **cannot be
-tuned away**. SB and HC, by contrast, reach ~0.1 %.
-
-One part of the gap *is* fixable: the 3 edges only PyInteraph finds all involve
-the Cys thiol donor. MDAnalysis pairs a donor with its hydrogens only within
-`d_h_cutoff` (default 1.2 Å), and the S–H bond is ~1.32 Å, so SG–HG1 H-bonds
-are never detected. With 1.4 Å they come out at PyInteraph's exact persistence
-(Cys86→Asp118 51.7 %, →Pro119 22.5 %). myPSNs does not pass `d_h_cutoff` yet —
-see *Open issues*.
-
-### Checking a run against PyInteraph
-
-`mypsns compare` compares residue × residue matrices type by type: edges
-(truth / computed / shared), entries whose values differ, and the % weight
-difference `100·Σ|computed−truth| / Σtruth` on the strict lower triangle
-(diagonal ignored — PyInteraph's `hb-graph.dat` keeps intra-residue H-bonds
-there). With `-o DIR` it writes `possible_sele_mismatch.csv` (edge in one matrix
-only), `possible_params_mismatch.csv` (both edges, values differ) and
-`comparison_summary.csv`; `--labels adjacency_labels.dat` adds residue labels.
-
-```bash
-# PyInteraph-named reference folder vs a contacts output folder
-mypsns compare --truth-dir ref/ --truth-suffix _1micros \
-               --computed-dir run/Adjacency/named_interactors -o cmp/
-# any pair of matrices, e.g. a PyInteraph macro-IIN vs the unweighted network
-mypsns compare --truth macroIIN=macro.dat \
-  --computed macroIIN=run/Network/named_interactors/matrices/persistency_unweighted_network_adjacency.dat
-# fail (exit 1) above a tolerance — usable as a CI check
-mypsns compare --preset pyinteraph_testcase --max-pct-diff SB=0.2 --max-pct-diff HC=0.2
-```
-
-`--preset pyinteraph_testcase` / `rec_grk1` reproduce the two lab datasets
-under `$MYPSNS_VALIDATION_ROOT` (default `/home/davide/storage/lab_dati`).
-`pytest` runs the unit tests plus a regression test on the PyInteraph test
-case (SB/HC ≤ 0.2 %, H-bonds ≤ 5 %), which is skipped when that data is absent.
-
-### Custom / non-standard residues
-
-Because rules are name-based, a non-standard residue just needs its own rule.
-Two worked examples (recoverin–GRK1):
+**Custom residues.** A recoverin–GRK1 example, a myristoylated glycine and Ca²⁺:
 
 ```yaml
 HC:
-- resname: [ALA, VAL, LEU, ILE, PHE, PRO, TRP, MET]
-  not atom_name: [N, CA, C, O, H, H1, H2, H3, O1, O2, OXT]
-# N-myristoylated Gly: keep the myristoyl tail C2–C14, drop the glycine
-# backbone and the amide-linker carbonyl (C1, O1).
-- resname: [GLM]
-  not atom_name: [N, CA, C, O, HN, HA1, HA2, C1, O1]
+- residue: [ALA, VAL, LEU, ILE, PHE, PRO, TRP, MET]
+  not atom_name: [N, CA, C, O, H, H1, H2, H3, O1, O2, OXT, OT1, OT2]
+- residue: [GLM]                           # myristoyl tail: not the Gly backbone or the C1=O1 linker
+  not atom_name: [N, HN, CA, HA1, HA2, C, O, C1, O1]
 Basic:
-# … standard Basic rules …
-# Ca²⁺ ion: single-atom cation; its +2 forcefield charge clears the gate,
-# so it pairs with Asp/Glu carboxylates as a salt bridge.
-- resname: [CAL]
+# … the default Basic rules …
+- resname: [CAL]                           # Ca²⁺: +2 clears the charge gate, pairs with Asp/Glu
   atom_name: [CAL]
 ```
 
-> **Changing rules requires re-running `interactors` with `--overwrite`.**
-> Roles are written to disk by the `interactors` stage (into
-> `found_topologies/*.csv`); `contacts` only reads them back. The stage **skips**
-> if its output already exists and `--overwrite` is not given, so after editing
-> `named_interactors_rules` (or any interactor option) you must re-run
-> `mypsns interactors … --overwrite`, then `contacts`. Re-running `contacts`
-> alone keeps the old roles. Quick check: the new `Contacts.log` selections
-> should reflect the change (e.g. a Met `HC` selection containing `SD` and `HN`).
+**`q_interactors`** derives roles from charges and connectivity instead:
+donors/acceptors from partial charges and element masses, charged groups from
+the summed charge of an atom's terminal subtree, HC atoms from low charge and
+bond distance to charged/polar atoms. A residue's HC atoms are split into
+bond-contiguous clusters of `min_num_heavy_ats`–`max_num_heavy_ats` heavy atoms
+(`HC1`, `HC2`, … in `HC_cluster`), each with its own centre of mass. The split
+is an exact, deterministic search (fewest size violations, then fewest
+clusters, then the alphabetically first); past a work budget (~1 s) it falls
+back to a greedy split with a warning. It is not PyInteraph-like: use
+`named_interactors` for PyInteraph-comparable results.
 
-## `contacts`
-
-Computes per-frame contacts and aggregates them into matrices. Reads
-`<outpath>/Interactors/`, writes `<outpath>/Adjacency/`.
-
-### Key options
-
-| Flag                      | Default                               | Meaning
-|---                        |---                                    |---
-| `--nc`                    | 2                                     | Parallel worker processes.
-| `--ram-thresh`            | 80                                    | RAM-usage %% that triggers a flush
-| `--nframes`               | 500                                   | Initial H-bond batch size (grows adaptively).
-| `--beg-frm` / `--end-frm` | 0 / -1                                | Frame range (`-1` = last frame).
-| `--interactors-type`      | `named_interactors`                   | Which role columns to consult. Repeatable.
-| `--target`                | `HBonds`, `Salt_bridges`, `HCs`       | Contact types to compute. Repeatable.
-| `--subject-chain`         | detected polymers                     | Chains that are the focus of contacts. Repeatable.
-| `--surrounding-chain`     | all chains                            | Candidate partner chains. Repeatable.
-| `--d-a-dist`              | 4.5 Å                                 | H-bond donor–acceptor distance cutoff.
-| `--angle`                 | 120°                                  | H-bond D–H–A angle cutoff (≥ cutoff kept; 180° = linear).
-| `--sb-cutoff`             | 4.5 Å                                 | Salt-bridge atom-pair distance cutoff.
-| `--hc-cutoff`             | 5.0 Å                                 | Hydrophobic-cluster centre-of-mass distance cutoff.
-| `--min-residue-charge`    | 0.8 e                                 | Net-charge gate for `Basic`/`Acidic` groups (named scheme). 0 disables.
-| `--matrix-type`           | `persistency`, `energy`               | Which matrices to build after contacts. Repeatable.
-| `--energy-use-abs / --no-energy-use-abs` | — | Energy → strength %% mapping: `\|E\|` vs attractive-only `max(0, -E)`.
-
-Defaults for `--d-a-dist` / `--angle` / `--sb-cutoff` / `--hc-cutoff` are the
-**PyInteraph 1–matching** values. (Earlier releases defaulted to `150°` / `3.5 Å`
-SB / `5.5 Å` HC — override the flags for the old behaviour.) These are global
-geometric cutoffs, independent of the interactor scheme.
-
-Two interactor schemas can be requested independently:
-
-- **`named_interactors`** (default) — PyInteraph 1–compatible, atom-name-based
-  role rules; **validated** to ~0.1 % (SB, HC) against PyInteraph 1.
-- **`q_interactors`** — charge- and connectivity-based roles (PIE-style).
-  Currently the less-validated of the two.
-
-### Selection strings
-
-Atom selections are emitted in a compact, human-readable form grouped by
-`(resname, atom-name set)`, e.g.
-
-(chainID A) and (
-    (resname ASP and resid 81 109 116 and name OD1 OD2)
-    or (resname GLU and resid 11 14 16 and name OE1 OE2)
-)
-
-This assumes **atom names are unique within a residue** (true for standard
-protein/lipid topologies). If a residue has duplicate atom names, rename them in
-the input PDB / forcefield first.
-
-### Workflow
-
-1. Reassemble a flat per-atom interactors table in memory from the three files
-   written by `interactors` (`found_topologies/<variant>.csv`,
-   `residue_index.csv`, `atom_index_map.csv`).
-2. Write a corrected-topology PDB (`<name>_correct.pdb`) with `Resindex` stamped
-   as `resid` and atom IDs aligned to `atom_index`. All subsequent MDAnalysis
-   operations use this topology.
-3. Split frames across `--nc` worker processes (PBC-aware distance kernels via
-   `capped_distance` / `self_capped_distance`).
-4. Per chain combination and contact type, dispatch workers; each streams its
-   frame chunk to partial CSVs `<name>_upto_<lastframe>.csv`, flushing whenever
-   RAM hits the ceiling. HC workers overwrite the Universe's masses with the
-   forcefield masses (from the interactors table) before computing each
-   side-chain centre of mass.
-5. Merge partials into `<name>_merged.csv` per chain combination.
-6. Aggregate merged CSVs into per-residue-pair tables `SB_final.csv`,
-   `Hbonds_final.csv`, `HC_final.csv`
-   (`res_1, res_2, n_frames_contact, mean_dist, chain_1, chain_2, label_1, label_2`).
-7. **Persistency matrices** — `{SB,Hbonds,HC}_adjacency.dat` (entry `[i,j]` is
-   the contact persistency in %) plus `combined_adjacency.dat` (frame-union).
-8. **Energy matrices** — `{SB,Hbonds,HC}_{LJ,Coulomb,total}_energy.dat`
-   (mean-per-frame LJ + Coulomb, kJ/mol). Energy is computed with constant
-   memory: per-frame rows stream to `<name>_energy.csv` companions, never
-   accumulating the whole trajectory in RAM.
-9. **Threshold analysis** — for every non-empty subset of the requested types,
-   scan the edge threshold and record the largest connected component +
-   degree distribution (elbow plots), to help pick a downstream cutoff.
-
-### Output layout
-
-```
-<outpath>/Adjacency/
-├── <name>_correct.pdb
-├── named/                         (and/or q/, per --interactors-type)
-│   ├── Salt_bridges/
-│   │   ├── *_upto_*.csv           (partial, per-worker)
-│   │   ├── *_merged.csv           (merged per chain-pair)
-│   │   └── *_sb_energy.csv        (per-frame energy stream)
-│   ├── H_bonds/   ( … *_Hbonds_energy.csv )
-│   ├── HCs/       ( … *_HC_energy.csv )
-│   ├── adjacency_labels.dat
-│   ├── SB_final.csv, Hbonds_final.csv, HC_final.csv
-│   ├── {SB,Hbonds,HC}_adjacency.dat        (persistency %)
-│   ├── combined_adjacency.dat
-│   ├── {SB,Hbonds,HC}_{LJ,Coulomb,total}_energy.dat
-│   ├── all_total_energy.dat                (element-wise sum across types)
-│   ├── graph_report/        (persistency elbow + degree CSVs/plots)
-│   └── energy_graph_report/ (energy strength elbow + distributions)
-```
-
-
-## `network`
-
-Builds residue-interaction graphs from the contacts output and renders PyMOL
-sessions. Reads `<outpath>/Adjacency/` and `<outpath>/Interactors/`, writes
-`<outpath>/Network/`. Standalone — run after `contacts`.
-
-### Key options
-
-| Flag | Default | Meaning
-|---|---|---
-| `--interactors-type` | `q_interactors`, `named_interactors` | Adjacency sub-folders to consume. Repeatable.
-| `--target` | `HBonds`, `Salt_bridges`, `HCs` | Contact types contributing to the graph. Repeatable.
-| `--edge-weight-source` | `persistency`, `energy` | Build one network per source. Repeatable. |
-| `--energy-use-abs / --no-energy-use-abs` | off | Energy → weight: `\|E\|` vs attractive-only `max(0, -E)`. |
-| `--weighting` | `both` | `weighted` (edge weight = value), `unweighted` (edge weight = 1 at/above threshold — binary macro-IIN analogue), or `both`. |
-| `--node-metric` | `betweenness_centrality` | Centrality driving CA-sphere scaling. Repeatable. |
-| `--community` | `louvain` | Community algorithm. `louvain`, `greedy_modularity`, `label_propagation`, `connected_components`. Repeatable. |
-| `--community-seed` | 42 | Seed for stochastic community algorithms. |
-| `--community-min-members` | 2 | Dissolve communities smaller than this (members → solitary, excluded from render/count). 1 keeps singletons. |
-| `--min-persistency` | 0.0 | Persistency threshold (%). Weighted graphs keep edges `>` it; unweighted keep edges `≥` it. |
-| `--min-energy` | 0.0 | Energy threshold (% of strongest edge). Weighted `>`, unweighted `≥`. |
-| `--min-degree` | 0 | Drop nodes below this degree. |
-| `--sphere-scale` | 2.0 | Max CA-sphere vdw radius (Å). |
-| `--stick-scale` | 0.5 | Max edge stick radius (Å). |
-| `--write-matrices / --no-write-matrices` | on | Dump each network's adjacency matrices (`.dat`, Adjacency format) under `Network/<inttype>/matrices/`. |
-| `--write-graphml / --no-write-graphml` | off | Also write one GraphML per static graph. |
-| `--shortest-paths / --no-shortest-paths` | off | All-pairs weighted shortest paths per graph. |
-| `--window-size` | — | If set, also build per-window energy networks and track community evolution. |
-| `--window-stride` | = window-size | Step between windows (non-overlapping by default). |
-| `--frame-start` / `--frame-stop` | — | Restrict to `[start, stop)`. **When set, static networks are re-aggregated from the per-frame energy CSVs over that range** instead of the pre-aggregated matrices.
-
-### Edge weights
-
-- **persistency** — from `{SB,Hbonds,HC}_adjacency.dat` (contact frequency, %).
-- **energy** — from `{SB,Hbonds,HC}_total_energy.dat`. Signed energy is mapped
-  to a non-negative weight: attractive-only `max(0, -E)` by default, or `|E|`
-  with `--energy-use-abs`, then normalised to "% of the strongest edge".
-
-How the requested targets are combined into one matrix per source:
-
-| | combined value | weighted edge | unweighted edge |
-|---|---|---|---|
-| persistency | element-wise **max** across targets (strongest single type, ≤ 100 %; union of per-type edges) | value, kept if `> --min-persistency` | 1 where value `≥ --min-persistency` |
-| energy | **sum** of per-type attractive (or `\|E\|`) weights, normalised to % of strongest | value, kept if `> --min-energy` | 1 where value `≥ --min-energy` |
-
-One graph is built per `(interactors_type × edge_weight_source × weighting)`.
-Weighted graphs are labelled `<source>`, unweighted ones `<source>_unweighted`,
-so with `--weighting both` the two coexist in every output file name.
-
-### Static vs time-resolved
-
-- **Static (default)** — uses the pre-aggregated contact matrices (fast).
-- **Time-resolved (`--window-size N`)** — reads the per-frame energy CSVs,
-  aggregates into windows of `N` frames, builds one graph per window, runs
-  community detection on each, and writes
-  `time_resolved/community_evolution_<source>_<method>.csv`
-  (`window_start, resindex, label, community` — pivot externally for a
-  community-vs-time heatmap).
-- **Frame range** — `--frame-start` / `--frame-stop` apply to both paths. When
-  set, the static graphs are rebuilt from the per-frame CSVs restricted to the
-  range (energy = mean per frame over the window; persistency = unique frames
-  per pair / frames in range), so they honour the sub-trajectory.
-
-### PyMOL rendering
-
-One `.pml` per node metric (`node_metrics/<source>_<metric>.pml`, CA spheres
-scaled by that metric) and one per community method
-(`community_metrics/<source>_<method>.pml`, uniform CA spheres coloured by
-community). Each script loads the reference structure as a translucent grey cartoon, places
-one pseudoatom per residue (on CA, or the centre of mass for residues without
-one, e.g. ions) and draws network edges as solid sticks scaled by edge weight.
-In `node_metrics/` every edge is **grey**. In `community_metrics/` an edge
-between two residues of the same community takes that community's colour (the
-colour of its spheres) and only edges that cross communities stay grey, so each
-community reads as a coloured sub-network. The palette has 16 colours and wraps
-around, so with more than 16 communities two of them share a colour.
-Residue selectors use the PDB residue numbering from the topology, so
-multi-chain offsets and non-contiguous numbering are handled correctly.
-Solitary nodes (community `-1`, from `--community-min-members`) are not drawn.
-
-### Network matrices
-
-With `--write-matrices` (default on), every static graph is also saved as
-adjacency matrices in the same format as `Adjacency/` (`numpy.savetxt` square
-matrix + shared `adjacency_labels.dat`), so they can be compared directly with
-PyInteraph graph files:
-
-- `<label>_network_adjacency.dat` — the final graph (after threshold and
-  `--min-degree`), rebuilt from the graph itself. Binary for unweighted labels.
-- `<label>_combined_adjacency.dat` — combined across targets, before thresholding.
-- `<label>_<target>_adjacency.dat` — per-target contribution (matrix path only;
-  persistency in %, energy as raw kJ/mol-derived weight).
-
-`persistency_unweighted_network_adjacency.dat` is the analogue of PyInteraph's
-macro-IIN (`filter_graph -d hb -d hc -d sb -t <cutoff>`). Fed PyInteraph's own
-per-type graphs, it reproduces a real PyInteraph macro-IIN exactly
-(recoverin–GRK1, cutoff 20.5 %: 331/331 edges). One semantic difference:
-`filter_graph` keeps values **>** the cutoff, the unweighted network keeps
-values **≥** `--min-persistency`, so a pair sitting exactly on the cutoff is an
-edge only here (no such pair on the validation data).
-
-### Output layout
-
-```
-<outpath>/Network/
-├── network.log
-└── <inttype>/
-    ├── csv/
-    │   ├── nodes_<label>_<method>.csv     (centrality + community per node)
-    │   ├── edges_<label>.csv
-    │   └── shortest_paths_<label>.csv     (with --shortest-paths)
-    ├── node_metrics/<label>_<metric>.pml        (grey edges)
-    ├── community_metrics/<label>_<method>.pml   (edges coloured by community, cross-community grey)
-    ├── matrices/                          (with --write-matrices)
-    ├── network_<label>.graphml            (with --write-graphml)
-    └── time_resolved/community_evolution_<label>_<method>.csv   (with --window-size)
-```
-
-## Notes
-### `na_values`
-
-Every `pandas.read_csv` in the package shares a default NA-string list. `"NA"`
-is deliberately **excluded** so sodium atoms/residues named `NA` are not parsed
-as missing values.
-
-### Cutoffs
-
-Defaults now match **PyInteraph 1** out of the box: salt bridges `4.5 Å`,
-hydrophobic-cluster CoM `5.0 Å`, H-bonds `4.5 Å` donor–acceptor + `120°` D–H–A.
-(Earlier releases defaulted to a tighter `3.5 Å` salt bridge, `5.5 Å` HC, and
-`150°` H-bond angle — override the flags if you need the old behaviour.) These
-are global geometric cutoffs, independent of the interactor scheme.
-
-### Ions and elements
-
-MDAnalysis guesses elements from atom names, which can mis-assign some ions
-(e.g. calcium `CAL` → carbon). Hydrophobic-cluster centres of mass are immune —
-they use **forcefield** masses loaded from `Interactors/found_topologies/`, not
-the guessed ones. Charge-based logic (the salt-bridge gate) likewise uses
-forcefield charges. If you add ions as charged groups, make sure the forcefield
-assigns them the expected charge (e.g. CHARMM `CAL` = +2), or the gate drops them.
-
-## Experimental: `compare-variants` (ClinVar variant comparison)
-
-Overlays ClinVar pathogenicity onto the networks and ranks node/edge metrics by
-how well they separate pathogenic missense sites from the rest of the protein
-(AUROC / AUPRC / Mann–Whitney). Standalone: run it after `network`. It needs
-internet access and the optional `variants` extra (`requests` + `biopython`).
-Without them the command stops with an install hint (exit code 3).
+## Testing
 
 ```bash
-pip install -e '.[variants]'
-mypsns compare-variants --config <outpath>/run_config.yaml \
-    --gene RCVRN --reference NP_002894.1
+pytest                    # everything, ~3–5 min
+pytest -m "not slow"      # without the end-to-end run, ~15 s
 ```
 
-What it does:
+| File | Covers |
+|---|---|
+| `test_pyinteraph_regression.py` (`slow`) | `mypsns run` on the shipped test case into `tmp_path`, compared with PyInteraph through the `pyinteraph_testcase` preset: tolerances, no PyInteraph-only edge, identical SB/HC edge sets |
+| `test_validation_utilities.py` | `compare` logic and CLI, presets complete and inside the repo |
+| `test_matrix_utilities.py` | thresholding, graph ↔ matrix, combining targets |
+| `test_build_results.py` | inter-chain contact files reach the aggregation |
+| `test_run_config_dump.py` | each stage updates only its sections of `run_config.yaml` |
+| `test_named_interactor_defaults.py` | one copy of the default rules; configs get a deep copy |
+| `test_terminal_hc.py` | HC side chain of terminal residues (patch atoms) |
+| `test_terminal_patches.py` | `.tdb` patches through ff-reader and recognition, `structure_atom_name` |
+| `test_hc_clusters.py` | `q_interactors` HC clusters, identical across hash seeds |
+| `test_charge_based_defaults.py` | q-scheme defaults from the config and their CLI forwarding |
+| `test_na_values.py` | atoms and residues named `NA` survive every CSV read |
+| `test_config_forcefield.py`, `test_stages_without_forcefield.py` | which commands need a forcefield path |
 
-1. **Rebuilds the static graphs** from `Adjacency/` with the `network:` settings
-   (targets, sources, weighting, thresholds, `min_degree`, frame range), using
-   the same code path as `network`. If you point `--config` at the
-   `run_config.yaml` that `network` wrote, it ranks exactly those graphs. Network
-   flags given on the command line override that section. Centralities are
-   computed in memory. Nothing under `Network/<inttype>/csv/` is rewritten.
-2. **Queries ClinVar** (`<gene>[gene]`, optionally narrowed to a GRCh38
-   `--chrom/--start/--stop` window) through NCBI E-utilities and keeps the
-   missense records. Each protein position gets a label: `non_benign` if it has
-   at least one pathogenic or likely-pathogenic record, `benign` if it has only
-   benign or likely-benign ones, and `vus` otherwise.
-3. **Maps positions onto the structure** by aligning the RefSeq protein
-   (global, BLOSUM62) to every protein chain (`Entity == 'P'`). The best chain
-   above `--min-identity` is taken as the gene's chain, which handles offsets,
-   gaps and complexes.
-4. **Scores each graph**. Positives are the `non_benign` sites. Negatives are
-   every other aligned residue (`--negative rest`) or only the `benign` sites
-   (`--negative benign`). Residues that do not align to the reference (partner
-   chains, ions, ligands) are not scored, because ClinVar says nothing about
-   them for this gene.
+No test reads outside the repository. Reference data live in `tests/data/`
+(`pyinteraph_testcase/`, `rec_grk1/`, each with a README on provenance);
+`tests/conftest.py` holds synthetic residues. `network` and `compare-variants`
+have no end-to-end test: check them by running the CLI on a finished run folder
+copied (or symlinked) into a scratch outpath, because every command writes into
+its outpath.
 
-### Key options
+## Validation against PyInteraph 1
 
-| Flag | Default | Meaning
-|---|---|---
-| `--gene` | required | Gene symbol queried in ClinVar.
-| `--reference` | required | RefSeq protein the ClinVar `p.` positions refer to: the NP_ of the transcript named in ClinVar titles (e.g. `NM_002903.3` → `NP_002894.1`). A raw protein sequence also works.
-| `--chrom` / `--start` / `--stop` | — | Optional GRCh38 window (all three or none). `--gene` alone already returns every record in the gene.
-| `--email` | — | Contact email sent to NCBI (env `NCBI_EMAIL`).
-| `--api-key` | — | NCBI API key, 10 requests/s instead of 3 (env `NCBI_API_KEY`). **Never written to `run_config.yaml`.**
-| `--negative` | `rest` | Negative class: `rest` (every other aligned residue) or `benign`.
-| `--min-identity` | 70 | Minimum % identity (over the structure chain) to accept a chain as the gene's.
-| `--interactors-type`, `--target`, `--edge-weight-source`, `--energy-use-abs`, `--weighting`, `--min-persistency`, `--min-energy`, `--min-degree`, `--frame-start`, `--frame-stop` | from `network:` | Graph rebuild; same meaning as in `network`.
-| `--overwrite` | off | Rewrite this gene's tables if they exist. Without it the stage skips.
-| `--dry-run` | off | Validate and print the plan. It also reports a missing `variants` extra.
+| Preset | Data | H-bonds | HC | SB |
+|---|---|---|---|---|
+| `pyinteraph_testcase` | PyInteraph's CHARMM example; config = myPSNs defaults | 3.93 % (282 / 309 / 282) | 0.11 % (79 / 79 / 79) | 0.07 % (21 / 21 / 21) |
+| `rec_grk1` | recoverin–GRK1, 1 µs, PyInteraph 1 graphs of 2018 | not run | 0.20 % (322 / 362 / 322) | 0.13 % (126 / 135 / 126) |
+| `rec_grk1_r1` | the same, replica r1 | 4.28 % (812 / 1045 / 812) | 0.13 % (223 / 244 / 223) | 0.10 % (99 / 112 / 99) |
 
-The ClinVar/scoring options live under `compare_variants:` in the YAML. The
-graph-rebuild options live under `network:`.
+Weight difference, then edges PyInteraph / myPSNs / shared; checked 2026-10-26.
+Every PyInteraph edge is found in all three. On rec_grk1 no SB/HC pair differs by
+more than 0.05 points, PyInteraph's 1-decimal rounding.
 
-### Output layout
+**Re-running.** The test case is the slow test (`pytest -m slow`), or by hand as
+in the [quick start](#quick-start) with its config:
 
-Every file is prefixed with the gene, so several genes of a complex can share
-the folder:
-
-```
-<outpath>/Network/
-├── compare_variants.log
-└── <inttype>/variants/
-    ├── <gene>_ranking_<label>.csv     one row per metric: auroc, auroc_oriented,
-    │                                  direction, auprc, mwu_p, n_pos, n_neg
-    │                                  (best first)
-    ├── <gene>_nodes_<label>.csv       per aligned residue: metrics, ref_pos, ref_aa,
-    │                                  ClinVar label
-    ├── <gene>_clinvar_sites.csv       per missense site: counts, label, chain,
-    │                                  resindex, resnum, structure vs reference aa
-    └── <gene>_clinvar_variants.csv    raw ClinVar records (dated snapshot)
+```bash
+D=tests/data/pyinteraph_testcase
+mypsns run --config $D/config.yaml -t $D/structures/sim.prot.gro -x $D/structures/traj.xtc \
+           -ff $D/forcefields/charmm36-apr2019_vm.ff -o /tmp/tc
+mypsns compare --preset pyinteraph_testcase --computed-dir /tmp/tc/Adjacency/named_interactors
 ```
 
-`<label>` follows `network` (`persistency`, `energy`, `*_unweighted`). The two
-`clinvar_*` tables are the same in every `<inttype>` folder.
+rec_grk1 needs the lab trajectory (`rec_grk1_1micros.xtc`, `rec_grk1_nolip.pdb`):
+`mypsns run --config tests/data/rec_grk1/config.yaml -t … -x … -ff … -o <out>`
+(`config_r1.yaml` for replica r1), then `compare --preset rec_grk1` (or
+`rec_grk1_r1`). That 2018 run used non-default settings: its own charged groups
+(no Arg; Ca²⁺ and neutral COOH termini included; charge gate off), the myristoyl
+in HC and an HC cutoff of 5.5 Å. `tests/data/rec_grk1/README.md` explains how
+they were read back from its output.
 
-### Notes
+**H-bonds are engine-limited.** myPSNs uses MDAnalysis `HydrogenBondAnalysis`
+(D–A ≤ 4.5 Å, D–H–A ≥ 120°); PyInteraph 1 has its own geometric test, which
+measures H···A. The edge sets agree, and the remaining ~4 % is small per-frame
+scatter between the two detectors that no parameter removes. One parameter did
+matter: MDAnalysis pairs donors with hydrogens within `d_h_cutoff`, whose 1.2 Å
+default is shorter than the Cys S–H bond (1.32 Å). myPSNs uses 1.4 Å; with 1.2 Å
+the test case loses 3 PyInteraph edges (Cys86 thiol donors) and sits at 4.56 %.
 
-- **Empty rankings are a data outcome, not an error.** If no pathogenic missense
-  site falls on a modelled residue, every `ranking` table has a header only and
-  the command warns. The site tables are still written. Example: RCVRN on the
-  rec_grk1 run (October 2026) has 18 missense sites (17 VUS, 1 benign, no
-  pathogenic), all mapped to chain A at 87 % identity.
-- **ClinVar changes over time.** Keep `<gene>_clinvar_variants.csv` with the
-  results.
-- Mismatches between `structure_aa` and `ref_aa` in `clinvar_sites` are expected
-  for orthologues (e.g. a bovine structure against human RefSeq). Many
-  mismatches suggest the wrong reference isoform.
-- From Python, it is a `Network` subclass:
+**Macro-IIN.** The unweighted persistency network reproduces PyInteraph's
+`filter_graph` macro-IINs: exactly when fed PyInteraph's own graphs (a
+recoverin–GRK1 macro-IIN at 20.5 %, 331 / 331 edges), and on the test case
+192 / 197 / 192 at 20 % from myPSNs' own contacts (the 5 extra pairs are H-bonds
+near the cutoff).
 
-```python
-from mypsns.services.compare_variants import CompareVariants
-cv = CompareVariants(topology_pdb=..., general_outpath=...)   # same constructor as Network
-cv.load_static(...)                                          # same arguments as `network`
-ranked = cv.rank_against_clinvar(gene="RCVRN", reference="NP_002894.1")
-cv.write_rankings(ranked, gene="RCVRN")
-```
+## Conventions
 
-## Open issues
+- **Defaults are validated.** The contact cutoffs and the default rules
+  reproduce PyInteraph 1; change them only with the regression test passing.
+- **`na_values`.** Every `pd.read_csv` passes the shared `DEFAULT_NA_VALUES`
+  (which excludes `"NA"`) **and** `keep_default_na=False`, otherwise sodium or a
+  heme nitrogen named `NA` reads as missing. `test_na_values.py` checks every call.
+- **One copy of the default rules**, `NAMED_INTERACTOR_DEFAULTS` in `config.py`;
+  `InteractorsConfig` hands out a deep copy, so never mutate the constant.
+- **Determinism.** Nothing iterates a set of atom names into a result (HC
+  clusters, chain bounds): sort first.
+- **`run_config.yaml`.** Each command records only its own section(s); `run`
+  records its four stages. A command that skips or fails still leaves the file
+  describing the run.
+- **Stage outputs are the interface.** Stages communicate only through the run
+  folder, so a stage can be re-run alone; keep file names and columns stable,
+  or update every reader and this README.
+- **Comments explain why.** Docstrings and comments are long and say why a
+  choice was made (often a PyInteraph detail); keep that style.
 
-- **Water parsing** from the forcefield can return inconsistent duplicate rows.
-  Workaround: water is matched against a bundled exact-match table
-  (`mypsns/resources/sol.csv`) at startup.
-- **H-bonds vs PyInteraph** plateau at ~4.5 % (mostly an engine difference —
-  see *H-bonds are engine-limited*). SB/HC reach ~0.1 %.
-- **Cys thiol H-bonds are missed.** `HydrogenBondAnalysis` is called without
-  `d_h_cutoff`, so its 1.2 Å default is shorter than the S–H bond (~1.32 Å) and
-  SG–HG1 is never paired as a donor. On the test case this accounts for all 3
-  PyInteraph-only H-bond edges. Passing ~1.4 Å fixes it, but changes validated
-  output: re-run the PyInteraph comparison when doing so.
-- **`network` needs `--config`.** The pipeline config requires `forcefield`, which
-  `network` neither uses nor exposes as a flag, so a flags-only
-  `mypsns network -t … -o …` fails validation. Pass a YAML with `forcefield:` set.
-- **`q_interactors`** is less validated than `named_interactors`. For HC
-  classification it uses a `min_bonds_to_polar` / `min_bonds_to_charged` BFS
-  rule; `min_bonds_to_polar=1` is needed mainly so ALA's Cβ is classified as HC.
-  It is **not** PyInteraph-like: on the PyInteraph test case it agrees with
-  `named_interactors` on the HC atoms of ALA/VAL/LEU/ILE/PHE/PRO/MET, but also
-  types Tyr (CB + ring), Thr CG2, Cys CB/SG and the CB of Arg/Gln/His as HC,
-  and drops Trp CD1/CE2/NE1 (next to the polar NE1). Contacts are measured
-  between clusters of ≤ `max_num_heavy_ats` heavy atoms instead of whole side
-  chains, so the HC network is far denser (207 vs 79 edges, 76 shared; mean
-  persistence of shared edges 55 % vs 25 %). Use `named_interactors` for
-  PyInteraph-comparable results. The
-  `q_interactors` HC clustering (`HC_cluster`) is **not reproducible between
-  runs**: it depends on Python's string-hash seed, so two `interactors` runs on
-  the same input can split LEU/PHE/TRP side chains into different clusters (set
-  `PYTHONHASHSEED` to compare runs). `named_interactors` is not affected.
-- **Repulsive interactions** are excluded from energy-weighted networks by
-  default (attractive-only). Use `--energy-use-abs` to include them.
-- **Terminal patches can leave stale bond names.** When recognition applies a
-  `.tdb` patch that renames atoms, the bonds of the other atoms keep the old
-  names. Example: an exactly matched `NHT3+` Met N-terminus whose `N` lists
-  `H1 H2 H3` while its atoms are `HT1–HT3`, so the N–HT bonds are missing.
-  `accept-topology` warns about such names in the topology it accepts.
-- **Tests cover helpers and the PyInteraph regression only.** `pytest` checks
-  the matrix/network helpers, `mypsns compare` and the test-case validation
-  (skipped without the lab data). Pipeline stages are still checked by running
-  the CLI on a real run folder.
-- **`rec_grk1` does not match its PyInteraph graphs** (H-bonds 33 %, HC 60 %,
-  SB 44 % weight difference; values correlate, r ≈ 0.8–0.9). The PyInteraph
-  settings of that run are unknown, so it is not a validation dataset.
+## Known issues and limitations
 
-## TODO
-
-The maintained development TODO list lives in [`CLAUDE.md`](CLAUDE.md#todo).
+- **H-bonds** differ from PyInteraph by ~4 % (detector, above); SB and HC by ~0.1 %.
+- **`q_interactors`** is less validated than `named_interactors`. On the test
+  case its HC set also includes Tyr, Thr CG2, Cys and the CB of Arg/Gln/His,
+  drops Trp CD1/CE2/NE1, and uses per-cluster centres of mass, so the HC network
+  is much denser (207 edges vs 79). Some residues get single-heavy-atom clusters
+  where the bonds allow nothing else (e.g. Leu around CG).
+- **Water parsing** from forcefields can produce inconsistent duplicate rows;
+  water is matched against the exact table `mypsns/resources/sol.csv` instead.
+- **Energy networks** count attractive interactions only unless
+  `--energy-use-abs`.
+- **Hand-edited terminal patches** must list the bonds of the atoms they add;
+  recognition warns when a patch leaves an atom unbonded.
+- **Selections** assume atom names are unique within a residue.
+- **Run folders made before 2026-10-26** may miss inter-chain H-bonds and
+  terminal HC atoms; see [`CHANGELOG.md`](CHANGELOG.md).

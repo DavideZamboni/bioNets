@@ -14,7 +14,7 @@ from ..logging_utils import (
 )
 
 from ._helpers import (
-    dump_run_config, ensure_dir,
+    contacts_done, dump_run_config, ensure_dir,
     load_or_die, require_path,
 )
 
@@ -136,7 +136,9 @@ def run_pipeline(
         raise typer.Exit()
 
     ensure_dir(cfg.outpath)
-    dump_run_config(cfg, cfg.outpath)
+    # the four stages `run` chains; network/compare_variants keep what they recorded
+    dump_run_config(cfg, cfg.outpath, sections=[
+        "ff_reader", "topology_recognition", "interactors", "contacts"])
 
     t0 = timeit.default_timer()
 
@@ -224,7 +226,7 @@ def _run_ff_reader(cfg, *, resume: bool, overwrite: bool) -> None:
             )
         print_success(f"ff-reader → {ff_out}")
     else:
-        print_success(f"forcefield-derived files already present in {ff_out}, skippng")
+        print_success(f"forcefield-derived files already present in {ff_out}, skipping")
 
 def _run_topology(cfg, *, resume: bool, overwrite: bool) -> None:
     topo_out = cfg.outpath / "Topology_recognition"
@@ -263,7 +265,8 @@ def _run_interactors(cfg, *, resume: bool, overwrite: bool) -> None:
     if gen_out.exists():
         already_foud = [f for f in gen_out.iterdir() if f.is_file() and f.suffix == '.csv']
         for f in already_foud:
-            tmp = pd.read_csv(f, header=0, index_col=False)
+            tmp = pd.read_csv(f, header=0, index_col=False,
+                              na_values=cfg.interactors.na_values, keep_default_na=False)
             cols = tmp.columns.to_list()
             if not ('named_interactors' in cols and 'q_interactors' in cols):
                 skip = False
@@ -290,8 +293,14 @@ def _run_interactors(cfg, *, resume: bool, overwrite: bool) -> None:
             min_abs_charge=cfg.interactors.min_abs_charge,
             max_abs_charge=cfg.interactors.max_abs_charge,
             max_num_heavy_ats=cfg.interactors.max_num_heavy_ats,
+            min_num_heavy_ats=cfg.interactors.min_num_heavy_ats,
             min_bonds_to_charged=cfg.interactors.min_bonds_to_charged,
             min_bonds_to_polar=cfg.interactors.min_bonds_to_polar,
+            # same set as `mypsns interactors`: without these two, `run` typed
+            # named_interactors with the built-in rules and 0.8 e gate whatever
+            # the config said
+            named_rules=cfg.interactors.named_interactors_rules,
+            min_residue_charge=cfg.interactors.min_residue_charge,
         )
         print_success(f"interactors → {int_out}")
 
@@ -299,7 +308,7 @@ def _run_contacts(cfg, *, resume: bool, overwrite: bool) -> None:
     cnt_out = cfg.outpath / "Adjacency"
     print_banner("Stage 4/4 — contacts")
  
-    if cnt_out.exists() and any(cnt_out.glob("*.dat")) and (resume or not overwrite):
+    if contacts_done(cfg) and (resume or not overwrite):
         print_info(f"contacts: skipped (adjacency output already present in {cnt_out}).")
         return
  
@@ -321,6 +330,7 @@ def _run_contacts(cfg, *, resume: bool, overwrite: bool) -> None:
         surrounding_chains=cfg.contacts.surrounding_chains,
         d_a_dist=cfg.contacts.d_a_dist,
         angle=cfg.contacts.angle,
+        d_h_cutoff=cfg.contacts.d_h_cutoff,
         sb_cutoff=cfg.contacts.sb_cutoff,
         hc_cutoff=cfg.contacts.hc_cutoff,
         na_values=cfg.contacts.na_values,

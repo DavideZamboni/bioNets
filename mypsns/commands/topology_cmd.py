@@ -151,7 +151,7 @@ def topology_recognition(
         print_error(f"topology failed: {e}")
         raise typer.Exit(code=1)
 
-    dump_run_config(cfg, cfg.outpath)
+    dump_run_config(cfg, cfg.outpath, sections=["ff_reader", "topology_recognition"])
     print_success(f"topology recognition complete → {topo_out}")
 
 

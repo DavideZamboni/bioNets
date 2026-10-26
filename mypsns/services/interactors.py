@@ -36,6 +36,7 @@ from mypsns.utils.interactors_utilities import (
     get_charge_based_interactors,
     get_named_interactors,
     reconstruct_whole_topology,
+    residue_name,
 )
 
 from mypsns.utils.general_utilities import get_endtime
@@ -126,7 +127,7 @@ class Interactors():
             raise FileNotFoundError(msg)
  
         topologies = pd.read_csv(
-            csv_path, header=0, index_col=False, na_values=self.nas
+            csv_path, header=0, index_col=False, na_values=self.nas, keep_default_na=False
         )
  
         # ff_atoms column that contains per-residue CSV forcefield data.
@@ -160,7 +161,8 @@ class Interactors():
         log.info('Reconstructing complete topology')
 
         try:
-            self.res_topol = pd.read_csv(self.inp / 'complete_residue_topologies.csv', header=0, index_col = False)
+            self.res_topol = pd.read_csv(self.inp / 'complete_residue_topologies.csv', header=0, index_col = False,
+                                         na_values=self.nas, keep_default_na=False)
 
         except FileNotFoundError:
             log.error('complete_residue_topologies.csv not found - run Topology_recognition.get_ff_parameters() first')
@@ -239,12 +241,25 @@ class Interactors():
             p for p in template_dir.iterdir()
             if p.is_file() and p.suffix == '.csv'
         )
+        # Terminal-patch names (NH3+, COO-, COOH, …) of the forcefield, so each
+        # variant's `residue` (the rule attribute that reaches patch atoms too)
+        # is the residue's own name, never the patch's.
+        ters = self.out.parent / 'forcefield' / 'final_ff_ters.csv'
+        patch_resnames = set()
+        if ters.exists():
+            patch_resnames = set(pd.read_csv(
+                ters, header=0, index_col=False, usecols=['resname'],
+                na_values=na_values, keep_default_na=False,
+            )['resname'].astype(str))
+        else:
+            log.warning('%s not found: `residue` of terminal variants may be a '
+                        'patch name', ters)
 
         for vpath in variant_files:
             log.debug('Processing variant %s', vpath.stem)
 
             vdf = pd.read_csv(
-                vpath, header=0, index_col=False, na_values=na_values
+                vpath, header=0, index_col=False, na_values=na_values, keep_default_na=False
             )
 
             # Scaffolding for analysis functions (they groupby Resindex
@@ -252,6 +267,7 @@ class Interactors():
             # collapse the loops to a single iteration with no neighbours.
             vdf['Resindex'] = 0
             vdf['Entity']   = 'M'
+            vdf['residue']  = residue_name(vdf, patch_resnames)
 
             vdf = get_charge_based_interactors(vdf, **kwargs)
 
@@ -262,7 +278,7 @@ class Interactors():
 
             vdf = get_named_interactors(vdf, **kwargs)
 
-            vdf.drop(columns=['Resindex', 'Entity'],
+            vdf.drop(columns=['Resindex', 'Entity', 'residue'],
                      inplace=True, errors='ignore')
             vdf.to_csv(vpath, header=True, index=False)
 

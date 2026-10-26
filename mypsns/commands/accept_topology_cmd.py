@@ -53,8 +53,9 @@ def accept_topology(
     """
     Resolve residues that `topology` could not match exactly.
 
-    Copies the chosen candidate to `found_topologies/<TOPOLOGY>_ff_atoms.csv`,
-    renaming its differently named atoms to the structure's names, and fills
+    Copies the chosen candidate to `found_topologies/<TOPOLOGY>_ff_atoms.csv`
+    with each atom's structure name in `structure_atom_name` (`interactors`
+    renames the atoms to those names), and fills
     `ff_atoms` in `unmatching_residue_topologies.csv`. Once every residue
     topology is resolved it writes `complete_residue_topologies.csv`, and
     `interactors` can run.

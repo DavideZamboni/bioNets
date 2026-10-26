@@ -259,70 +259,138 @@ def get_replaced_removed_terAtoms(ter_residue: pd.DataFrame) -> Tuple[set, list,
 
     return replaced_removed, to_be_removed, to_be_replaced
 
+def bond_tokens(bonds) -> List[str]:
+    '''The tokens of a bonds cell ('' and NaN give []).'''
+    return [t for t in bonds.split() if t] if isinstance(bonds, str) else []
+
+def is_patch_instruction(token: str) -> bool:
+    '''
+    True for a token of a terminal-patch row (final_ff_ters.csv) that is an
+    instruction rather than a bond. ff_reader writes the .tdb sections into the
+    bonds column of the patch rows as "rX" ([ replace ]: this atom replaces
+    atom X) and "-X" ([ delete ]: the patch deletes atom X, repeated on every
+    row of the patch), plus "+X" when an [ add ] control atom is not one of the
+    patch's own rows. Inside a patch row none of them is a bond, unlike "-X" /
+    "+X" in a residue row, which name atoms of the previous / next residue.
+    '''
+    return token[0] in '-+r'
+
 def get_ter_ffres(ter_residue: pd.DataFrame, ff_residue: pd.DataFrame,to_be_replaced: dict, to_be_removed: List) -> pd.DataFrame:
-    #print('All atoms to be replaced or removed are present in forcefield residue')
-    tmp = ff_residue.copy()
-    tmp = tmp[~tmp['atom_name'].isin(to_be_removed)]  # now correctly filtered
-    rep = []
-    for k in to_be_replaced.keys():
-        rep.append(k)
-        if k != to_be_replaced[k]:
-            to_be_removed.append(to_be_replaced[k])
+    '''
+    Apply one terminal patch (a .tdb entry, as ff_reader stores it in
+    final_ff_ters.csv) to a forcefield residue: to its atoms AND to every bonds
+    list.
 
-    log.debug('ter replace: to_be_replaced=%s to_be_removed=%s', to_be_replaced, to_be_removed)
-    atnames = tmp['atom_name'].to_list()
+     - ter_residue: the patch's rows
+     - ff_residue: the residue's rows (final_ff_residues.csv)
+     - to_be_replaced: {patch atom name: residue atom it replaces}, from the
+       "rX" tokens. A different name renames the atom (e.g. the apr2019 COO-
+       replaces O by OT1).
+     - to_be_removed: residue atoms the patch deletes (its "-X" tokens that
+       the residue has).
 
-    bonds_to_edit = {}
-    for an in to_be_replaced.keys():
-        myat = tmp[tmp['atom_name'] == to_be_replaced[an]]
-        terat = ter_residue[ter_residue['atom_name'] == an]
-        cols = [
-            'resname','atom_name','atom_type','mass',
-            'charge','chargegroup','sigma','epsilon'
-        ]
-        # substitute columns of replaced atoms (no bonds, need to be adjusted)
-        tmp.loc[myat.index, cols] = terat[cols].values
+    Atoms: deleted atoms are dropped; a replaced atom takes the patch row's
+    name, type, mass, charge, chargegroup, sigma and epsilon; the patch's other
+    rows are added after the residue's atoms.
 
-        at_b_entry = tmp.at[myat.index[0], 'bonds']
-        ter_b_entry = ter_residue.at[terat.index[0], 'bonds']
-        resbonds = [b for b in at_b_entry.split(' ') if b != '']
-        terbonds = [b for b in ter_b_entry.split(' ') if b != '']
+    Bonds get the same edits:
+     - a deleted atom disappears from every bonds list, and a renamed atom is
+       renamed in every bonds list, not only in its own row;
+     - a replaced atom keeps its residue bonds, minus "+X" (a patch that
+       replaces the atom bonded to the next residue makes a C-terminus), and
+       gains the bonds its patch row lists;
+     - an added atom gets the bonds its patch row lists, without the patch's
+       instruction tokens (is_patch_instruction);
+     - bonds within the residue are made two-sided. ff_reader records the
+       bond between an [ add ] atom and its control atom in the control atom's
+       row, and its substring checks used to drop it from the added row (the
+       "N" of an NH3+ H1 is "in" "-HN");
+     - a token that names no atom of the patched residue is dropped. Leaving
+       it is how a hand-made NHT3+ (NH3+ with its added H1-H3 renamed HT1-HT3
+       but N still listing "H1 H2 H3") reached found_topologies. Such a patch
+       leaves atoms without bonds, which save_results reports.
 
-        # also removing e.g. +N when attempting to build a Cter
-        truebonds = [b for b in resbonds if b not in to_be_removed and not b.startswith('+')]
-        for b in terbonds:
-            if (b not in truebonds) and (b[0] not in ['-','r']):
-                truebonds.append(b)
-                
-        for b in truebonds:
-            if b in ter_residue['atom_name'].to_list() and b not in atnames:
-                bonds_to_edit[b] = an
+    A bonds cell that none of these edits changes is kept byte for byte.
 
-        mybs = ''
-        if len(truebonds) > 1:
-            mybs += ' '.join(truebonds) + ' '
-        else:
-            if len(truebonds)  == 0:
-                truebonds.append('')
-                
-            mybs += f'{truebonds[0]} '
-        tmp.at[myat.index[0], 'bonds'] = mybs
-    
-    atnames = tmp['atom_name'].to_list()
-    # now need to add atoms generated by ter definition to ff_residue
-    # before need to adjust bonding info according to replaced atoms
-    to_add = ter_residue[~ter_residue['atom_name'].isin(atnames)].copy()
-    log.debug('ter replace: atoms to be added: %s', to_add['atom_name'].to_list())
+    Before, only the replaced atoms' own rows were edited: renamed and deleted
+    names survived in the other rows, and an added atom that its control atom
+    did not list by name kept the instruction tokens as bonds (NHT3+ HT1
+    "-HN -HN1 -HN2 -HT1 -HT2", which every later stage reads as bonds to the
+    previous residue).
+    '''
+    # a replacement wins over a deletion of the same atom
+    removed = set(to_be_removed) - set(to_be_replaced.values())
+    tmp = ff_residue[~ff_residue['atom_name'].isin(removed)].copy()
 
-    for ix, row in to_add.iterrows():
-        atname = to_add.at[ix, 'atom_name']
-        if atname in bonds_to_edit.keys():
-            to_add.at[ix, 'bonds'] = bonds_to_edit[atname]
+    # resolve every replaced row before renaming any of them, so that a rename
+    # onto a name that another replacement frees cannot pick the wrong row
+    replaced_ix = {new: tmp.index[tmp['atom_name'] == old][0]
+                   for new, old in to_be_replaced.items()}
+    renames = {old: new for new, old in to_be_replaced.items() if new != old}
+    ter_ix = {an: ix for ix, an in ter_residue['atom_name'].items()}
+    log.debug('ter replace: to_be_replaced=%s removed=%s renames=%s',
+              to_be_replaced, sorted(removed), renames)
 
+    cols = ['resname', 'atom_name', 'atom_type', 'mass',
+            'charge', 'chargegroup', 'sigma', 'epsilon']
+    for new, ix in replaced_ix.items():
+        tmp.loc[ix, cols] = ter_residue.loc[ter_ix[new], cols].values
+
+    # added atoms: patch rows whose name the patched residue does not have yet
+    to_add = ter_residue[~ter_residue['atom_name'].isin(tmp['atom_name'])].copy()
     to_add.rename(columns={'tdb_file': 'rtp_file'}, inplace=True)
-    tmp = pd.concat([tmp, to_add], ignore_index=True)
+    log.debug('ter replace: atoms to be added: %s', to_add['atom_name'].to_list())
+    out = pd.concat([tmp, to_add], ignore_index=True)
+    names = out['atom_name'].tolist()
+    nameset = set(names)
+    n_res = tmp.shape[0]
+    replaced_rows = {tmp.index.get_loc(ix) for ix in replaced_ix.values()}
 
-    return tmp
+    def patch_bonds(atom_name):
+        # a patch row names atoms by their final names; map a renamed-away
+        # name only when it is not itself an atom of the patched residue
+        return [t if t in nameset else renames.get(t, t)
+                for t in bond_tokens(ter_residue.at[ter_ix[atom_name], 'bonds'])
+                if not is_patch_instruction(t)]
+
+    original = out['bonds'].tolist()
+    bonds = []
+    for row, (an, cell) in enumerate(zip(names, original)):
+        if row < n_res:
+            toks = []
+            for t in bond_tokens(cell):
+                if t[0] == '+' and row in replaced_rows:
+                    continue
+                if t[0] not in '+-':
+                    if t in removed:
+                        continue
+                    t = renames.get(t, t)
+                toks.append(t)
+            if row in replaced_rows:
+                toks += patch_bonds(an)
+        else:
+            toks = patch_bonds(an)
+        bonds.append(list(dict.fromkeys(toks)))   # drop repeats, keep order
+
+    for row, toks in enumerate(bonds):
+        dangling = [t for t in toks if t[0] not in '+-' and t not in nameset]
+        if dangling:
+            log.debug('ter %s: %s lists %s, not atoms of the patched residue; dropped',
+                      ter_residue['resname'].iloc[0], names[row], dangling)
+            bonds[row] = [t for t in toks if t not in dangling]
+
+    row_of = {an: row for row, an in enumerate(names)}
+    for row, toks in enumerate(bonds):
+        for t in list(toks):
+            if t[0] in '+-' or t == names[row]:
+                continue
+            partner = bonds[row_of[t]]
+            if names[row] not in partner:
+                partner.append(names[row])
+
+    out['bonds'] = [cell if row < n_res and bond_tokens(cell) == toks else ' '.join(toks)
+                    for row, (cell, toks) in enumerate(zip(original, bonds))]
+    return out
 
 def get_res_w_ter(ter_residue: pd.DataFrame, ff_residue: pd.DataFrame) -> pd.DataFrame:
     '''
@@ -566,7 +634,8 @@ def save_results(out : Path, found_residues: dict, best_choices: dict, nas: list
     makedirs(possible_topologies_path, exist_ok = True)
 
     # retrieve df with info about different topologies in the input structure
-    different_residue_topologies = pd.read_csv(out / 'different_residue_topologies.csv', header = 0, index_col = False)
+    different_residue_topologies = pd.read_csv(out / 'different_residue_topologies.csv', header = 0, index_col = False,
+                                               na_values = nas, keep_default_na = False)
     
     # initilize result columns
     different_residue_topologies["ff_atoms"] = ""
@@ -598,7 +667,22 @@ def save_results(out : Path, found_residues: dict, best_choices: dict, nas: list
                       resname, unique_top_resname, ff_topology_name)
 
             different_residue_topologies.loc[ix, "ff_atoms"] = ff_topology_name
-            found_residues[unique_top_resname].to_csv(found_topologies_path / ff_topology_name, header = True, index = False)
+            # an exact match has the structure's atom names, so each atom's
+            # structure name is its own; the column makes that explicit and is
+            # the one accept-topology fills with differing names
+            ff_atoms = with_structure_names(found_residues[unique_top_resname],
+                                            found_residues[unique_top_resname]['atom_name'])
+            unbonded = unbonded_patch_atoms(ff_atoms)
+            if unbonded:
+                log.warning('Residue %s (%s): the terminal patch %s leaves %s without a bond to '
+                            'any other atom of the residue. Fix that patch\'s rows in the '
+                            'forcefield\'s final_ff_ters.csv (bonds column) and re-run '
+                            '`mypsns topology --overwrite`.',
+                            resname, unique_top_resname,
+                            '/'.join(sorted(set(ff_atoms.loc[ff_atoms['atom_name'].isin(unbonded),
+                                                             'resname'].astype(str)))),
+                            ' '.join(unbonded))
+            ff_atoms.to_csv(found_topologies_path / ff_topology_name, header = True, index = False)
 
         elif unique_top_resname in best_choices.keys():
             complete_match = False
@@ -661,14 +745,17 @@ def associate_ff_params(ff: Path, out: Path, nas: list, maxToCheck: int) -> Tupl
 
     # 1 - load unique topologies found in input topology file
     try:
-        restypes= pd.read_csv(out / 'different_residue_topologies.csv', header = 0, index_col = False,  na_values = nas)
+        restypes= pd.read_csv(out / 'different_residue_topologies.csv', header = 0, index_col = False,  na_values = nas,
+                              keep_default_na = False)
     
     except FileNotFoundError:
         exit
 
     # 2 - Load interactors table (forcefield parameters)
-    ff_params = pd.read_csv(ff / "final_ff_residues.csv", header=0, index_col = False, na_values = nas)
-    ter_params = pd.read_csv(ff / "final_ff_ters.csv", header=0, index_col = False, na_values = nas)
+    ff_params = pd.read_csv(ff / "final_ff_residues.csv", header=0, index_col = False, na_values = nas,
+                            keep_default_na = False)
+    ter_params = pd.read_csv(ff / "final_ff_ters.csv", header=0, index_col = False, na_values = nas,
+                             keep_default_na = False)
     ff_params['bonds'] = ff_params['bonds'].fillna('')
     ter_params['bonds'] = ter_params['bonds'].fillna('')
 
@@ -687,7 +774,8 @@ def associate_ff_params(ff: Path, out: Path, nas: list, maxToCheck: int) -> Tupl
     ### ITERATE OVER ALL POSSIBLE RESIDUE TOPOLOGIES (RESIDUES WITH SAME SET OF ATOMS) IN TOPOLOGY
     for at_path, topres_df in restypes.groupby(by = 'atoms'):
         top_residuename = topology_key(at_path)
-        top_atoms_df = pd.read_csv(out / "resid_topologies" / at_path, header = 0, index_col = False, na_values = nas)
+        top_atoms_df = pd.read_csv(out / "resid_topologies" / at_path, header = 0, index_col = False, na_values = nas,
+                                   keep_default_na = False)
         # results: dictionary:
         #  - keys: residue names found in topology
         #  - values: lists of tuples with entries
@@ -733,6 +821,16 @@ COMPLETE_TABLE = 'complete_residue_topologies.csv'
 # the LJ sigma/epsilon used for the energy matrices.
 FF_ATOM_COLUMNS = ['rtp_file', 'resname', 'atom_name', 'atom_type', 'charge',
                    'chargegroup', 'bonds', 'sigma', 'epsilon', 'mass']
+
+# Column of found_topologies/<key>_ff_atoms.csv, next to atom_name, with each
+# atom's name in the input structure. atom_name (and bonds) keep the
+# forcefield's names, so every atom can be traced to both. Recognition only
+# writes exact matches (the two names are equal); accept-topology writes the
+# names its pairing found. The interactors stage builds the whole topology in
+# the structure's names (structure_named), because contacts joins it with the
+# structure on (Resindex, atom_name). A file without the column (written
+# before it existed, or copied by hand) is used as is.
+STRUCTURE_NAME_COLUMN = 'structure_atom_name'
 
 # Max |mass difference| (amu) for a renamed atom pair to count as the same atom.
 # The structure's masses can be MDAnalysis guesses (O 15.999 against the
@@ -838,15 +936,62 @@ def rename_candidate_atoms(cand: pd.DataFrame, renames: dict) -> pd.DataFrame:
     renamed['bonds'] = renamed['bonds'].map(_rename_bonds)
     return renamed
 
+def with_structure_names(ff_atoms: pd.DataFrame, structure_names) -> pd.DataFrame:
+    '''
+    Copy of a forcefield topology with STRUCTURE_NAME_COLUMN set to
+    structure_names (one per row, in row order) and placed right after
+    atom_name. A column already there (e.g. in a CSV copied from
+    found_topologies/) is replaced.
+    '''
+    out = ff_atoms.drop(columns = [STRUCTURE_NAME_COLUMN], errors = 'ignore')
+    out.insert(out.columns.get_loc('atom_name') + 1, STRUCTURE_NAME_COLUMN,
+               list(structure_names))
+    return out
+
+def structure_named(ff_atoms: pd.DataFrame) -> pd.DataFrame:
+    '''
+    A found topology as the later stages use it: atom_name, and every bonds
+    entry naming those atoms, in the structure's names (rename_candidate_atoms
+    with the STRUCTURE_NAME_COLUMN pairs), without that column. A topology
+    without the column is returned unchanged.
+    '''
+    if STRUCTURE_NAME_COLUMN not in ff_atoms.columns:
+        return ff_atoms
+    renames = {ff: st for ff, st in zip(ff_atoms['atom_name'], ff_atoms[STRUCTURE_NAME_COLUMN])
+               if isinstance(st, str) and st and st != ff}
+    out = rename_candidate_atoms(ff_atoms, renames) if renames else ff_atoms.copy()
+    return out.drop(columns = [STRUCTURE_NAME_COLUMN])
+
+def unbonded_patch_atoms(ff_atoms: pd.DataFrame) -> List[str]:
+    '''
+    Names of the terminal-patch atoms (chargegroup -1, ff_reader's mark for
+    patch rows) of a multi-atom residue that have no bond to another atom of
+    the residue. Every atom a .tdb patch adds or replaces is bonded to the
+    residue, so a non-empty result means the patch's bonds are wrong in
+    final_ff_ters.csv (e.g. a hand-made NHT3+ whose N still lists H1-H3).
+    '''
+    if ff_atoms.shape[0] <= 1 or 'chargegroup' not in ff_atoms.columns:
+        return []
+    names = ff_atoms['atom_name'].astype(str).tolist()
+    nameset = set(names)
+    bonded = {an: False for an in names}
+    for an, cell in zip(names, ff_atoms['bonds']):
+        for t in bond_tokens(cell):
+            if t in nameset and t != an:
+                bonded[an] = bonded[t] = True
+    patch = pd.to_numeric(ff_atoms['chargegroup'], errors = 'coerce') == -1
+    return [an for an, is_patch in zip(names, patch) if is_patch and not bonded[an]]
+
 def dangling_bonds(ff_atoms: pd.DataFrame) -> dict:
     '''
     {atom_name: [bond partners that are not atoms of this residue]}, ignoring
     "-" / "+" tokens (atoms of the previous / next residue).
 
     After a hand edit, a non-empty result usually means atom_name was changed
-    but the bonds column was not. It is only a warning: recognition's own
-    terminal patching can leave such names too (e.g. an NHT3+ N-terminus whose
-    N lists "H1 H2 H3" while its atoms are HT1-HT3).
+    but the bonds column was not. It is only a warning. Recognition's terminal
+    patching drops such names (get_ter_ffres); topologies it wrote before
+    that can still have them (e.g. an NHT3+ N-terminus whose N lists
+    "H1 H2 H3" while its atoms are HT1-HT3).
     '''
     names = set(ff_atoms['atom_name'].astype(str))
     dangling = {}

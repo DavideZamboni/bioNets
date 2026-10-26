@@ -1,75 +1,89 @@
-# myPSNs run configuration
+# myPSNs run configuration — every stage, values at their defaults.
 #
-# Top-level keys map to PipelineConfig fields; per-stage keys nest below.
-# CLI options always override the values you put here.
-# Run `mypsns validate --config config.yaml` to check this file.
+# Runs as is from the repository root on the shipped PyInteraph test case:
+#   mypsns run     --config example_config.yaml
+#   mypsns network --config example_config.yaml
+# Copy it for your own system and change the paths. Top-level keys are paths;
+# each stage reads its own section. Flags on the command line override this
+# file, and every stage records what it used in <outpath>/run_config.yaml.
+# Check a config without running anything: mypsns validate --config <file> --deep
 
-# ── General ─────────────────────────────────────────────────────────────────
-topology:    /data/protein.pdb
-trajectory:  /data/traj.xtc              # only needed for `contacts` and `run`
-forcefield:  /forcefields/amber99sb.ff
-outpath:     /scratch/mypsns_run01
-log_file:    /scratch/mypsns_run01/run.log
+# ── Paths ────────────────────────────────────────────────────────────────────
+# Relative paths resolve against the directory you run mypsns from.
+topology:   tests/data/pyinteraph_testcase/structures/sim.prot.gro    # PDB, GRO, …
+trajectory: tests/data/pyinteraph_testcase/structures/traj.xtc        # contacts and run only
+forcefield: tests/data/pyinteraph_testcase/forcefields/charmm36-apr2019_vm.ff   # GROMACS .ff folder
+outpath:    /tmp/mypsns_example                                       # run folder (created)
 
-
-# ── Forcefield reader ───────────────────────────────────────────────────────
+# ── ff-reader: parse the forcefield folder ──────────────────────────────────
 ff_reader:
-  nonbonded_name:      ffnonbonded.itp
-  additional_residues: true
+  nonbonded_name: ffnonbonded.itp   # .itp with atom types, masses, sigma/epsilon
+  additional_residues: true         # also add the residues bundled in mypsns/resources/
 
-
-# ── Topology recognition ────────────────────────────────────────────────────
+# ── topology: match every residue of the structure to a forcefield entry ────
 topology_recognition:
-  max_to_check: -1                       # -1 = inspect every ff entry
-  verbose:      false
+  max_to_check: 30                  # forcefield entries tried per residue; -1 = all
 
-
-# ── Interactors ─────────────────────────────────────────────────────────────
+# ── interactors: give atoms their interaction roles ─────────────────────────
 interactors:
-  modes:
-    - named_interactors
-    # - q_interactors
-
-  # HBond
+  modes: [named_interactors]        # recorded scheme(s); both role columns are always written
+  min_residue_charge: 0.8           # named: net charge (e) a Basic/Acidic group needs; 0 = off
+  # named_interactors_rules: the PyInteraph 1 rule set by default. To change it,
+  # copy the block from any run_config.yaml: a rule set given here REPLACES the
+  # defaults (README, "Interactor rules").
+  # q_interactors (charge/connectivity-based) parameters:
   max_DA_charge: -0.3
-  min_H_charge:   0.3
-  DA_masses:    [14, 16, 19]
-
-  # Salt bridge
+  min_H_charge: 0.3
+  DA_masses: [14, 16, 19]
   min_abs_charge: 0.75
+  max_abs_charge: 0.27
+  max_num_heavy_ats: 3
+  min_num_heavy_ats: 2
+  min_bonds_to_charged: 3
+  min_bonds_to_polar: 1
 
-  # Hydrophobic cluster
-  max_abs_charge:        0.27
-  max_num_heavy_ats:     3
-  min_bonds_to_charged:  3
-
-  verbose: false
-
-
-# ── Contacts ────────────────────────────────────────────────────────────────
+# ── contacts: per-frame contacts → persistency / energy matrices ────────────
 contacts:
-  # parallelization
-  nc:         8
-  ram_thresh: 80
-  nframes:    500
-
-  # trajectory window
+  nc: 2                             # worker processes
+  ram_thresh: 80                    # % RAM at which H-bond batches stop growing
+  nframes: 500                      # initial H-bond batch (frames)
   beg_frm: 0
-  end_frm: -1
+  end_frm: -1                       # inclusive; -1 = last frame
+  interactors_type: [q_interactors, named_interactors]
+  targets: [HBonds, Salt_bridges, HCs]
+  subject_chains: null              # null = every polymer chain
+  surrounding_chains: null          # null = every chain
+  # cutoffs (PyInteraph 1 values)
+  d_a_dist: 4.5                     # H-bond donor–acceptor [Å]
+  angle: 120.0                      # H-bond D–H–A, kept when ≥ [°]
+  d_h_cutoff: 1.4                   # donor–hydrogen pairing [Å]; 1.2 misses Cys S–H
+  sb_cutoff: 4.5                    # salt bridge, any atom pair [Å]
+  hc_cutoff: 5.0                    # hydrophobic side-chain centres of mass [Å]
+  matrix_type: [persistency, energy]
+  energy_use_abs: false
+  thr_step: 0.1                     # step (%) of the threshold scans in graph_report/
 
-  # selectors
-  interactors_type:
-    - named_interactors
-  targets:
-    - HBonds
-    - Salt_bridges
-    - HCs
-
-  subject_chains:     null               # null = auto-detect polymer chains
-  surrounding_chains: null               # null = all detected chains
-
-  # geometric cutoffs
-  d_a_dist:   4.5
-  angle:    150.0
-  sb_cutoff:  3.5
-  hc_cutoff:  5.5
+# ── network: graphs, centralities, communities, PyMOL scripts ───────────────
+network:
+  interactors_type: [q_interactors, named_interactors]
+  targets: [HBonds, Salt_bridges, HCs]
+  edge_weight_sources: [persistency, energy]
+  energy_use_abs: false             # false: weight = max(0, -E); true: |E|
+  weighting: both                   # weighted | unweighted | both
+  min_persistency: 0.0              # keep edges > this (%)
+  min_energy: 0.0                   # keep edges > this (% of the strongest edge)
+  min_degree: 0
+  node_metrics: [betweenness_centrality]   # also: degree, weighted_degree,
+                                           # degree_centrality, closeness_centrality
+  community_methods: [louvain]      # also: greedy_modularity, label_propagation,
+                                    # connected_components
+  community_seed: 42
+  community_min_members: 2
+  sphere_scale: 2.0                 # PyMOL: max sphere radius [Å]
+  stick_scale: 0.5                  # PyMOL: max edge radius [Å]
+  write_matrices: true
+  write_graphml: false
+  shortest_paths: false
+  # reference_pdb: structure loaded by the .pml scripts (default: contacts' corrected PDB)
+  # window_size / window_stride: time-resolved community tracking (frames)
+  # frame_start / frame_stop: restrict every graph to [start, stop)

@@ -16,6 +16,13 @@ dependencies:
   - mdanalysis>=2.7
   - scipy
 
+  # `variants` extra in pyproject.toml: `mypsns compare-variants` (ClinVar + RefSeq alignment)
+  - requests
+  - biopython
+
+  # `dev` extra in pyproject.toml (tests: `pytest` from the repo root)
+  - pytest
+
   # install package
   - pip:
       - -e .

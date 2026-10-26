@@ -66,3 +66,6 @@ dev = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "slow: runs the pipeline end to end on shipped data (minutes); deselect with -m \"not slow\"",
+]

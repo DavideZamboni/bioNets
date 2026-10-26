@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import copy
 from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional, Sequence
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
@@ -74,19 +74,27 @@ class TopologyConfig(BaseModel):
 # as read-only — InteractorsConfig hands out a deep copy.
 #
 # Example (resname-scoped donor): {"resname": ["CYS"], "atom_name": ["SG"]}
+#
+# Attributes are columns of the per-residue tables: atom_name, resname (the
+# forcefield name of the atom's own entry, so a terminal patch atom carries the
+# patch name: NH3+, COO-, COOH, …), residue (the name of the residue the atom
+# belongs to, patch atoms included), atom_type, …
 NAMED_INTERACTOR_DEFAULTS: Dict[str, list] = {
     # Hydrophobic side chains (PyInteraph hc_reslist); side-chain atoms only.
-    # Uses PyInteraph's EXACT exclusion set: backbone + AMBER amide H + the
-    # nter/cter oxygens it lists. The CHARMM amide HN is deliberately NOT
-    # excluded — PyInteraph includes it in the side-chain COM (it only drops
-    # 'H'), and matching that is what brings HC to ~0.1% vs PyInteraph. Met SD /
-    # Trp NE1 also stay in the COM (the HC tag is not stripped from atoms that
-    # also carry a donor/acceptor role).
+    # Uses PyInteraph's EXACT exclusion set (generate_sc_identifiers): backbone
+    # + AMBER amide H + the nter/cter names it lists. The CHARMM amide HN is
+    # deliberately NOT excluded — PyInteraph includes it in the side-chain COM
+    # (it only drops 'H'), and matching that is what brings HC to ~0.1% vs
+    # PyInteraph. Met SD / Trp NE1 also stay in the COM (the HC tag is not
+    # stripped from atoms that also carry a donor/acceptor role).
+    # Selected by `residue`, not `resname`: PyInteraph takes every atom of the
+    # residue, so the HA of an N-terminal patch or the HT2 of a COOH C-terminus
+    # (patch resnames) belong to a terminal Leu's centre of mass too.
     "HC": [
         {
-            "resname": ["ALA", "VAL", "LEU", "ILE", "PHE", "PRO", "TRP", "MET"],
+            "residue": ["ALA", "VAL", "LEU", "ILE", "PHE", "PRO", "TRP", "MET"],
             "not atom_name": ["N", "CA", "C", "O", "H", "H1", "H2", "H3",
-                              "O1", "O2", "OXT"],
+                              "O1", "O2", "OXT", "OT1", "OT2"],
         },
     ],
     # hydrogen_bonds.ini DONORS
@@ -165,6 +173,12 @@ class InteractorsConfig(BaseModel):
         default=3, ge=1,
         description="Max heavy atoms per HC sub-cluster.",
     )
+    # Soft bound: the split minimises size violations, it does not forbid them,
+    # and a residue with a single HC-eligible atom keeps it as its own cluster.
+    min_num_heavy_ats: int = Field(
+        default=2, ge=1,
+        description="Min heavy atoms per HC sub-cluster (soft bound of the split).",
+    )
     min_bonds_to_charged: int = Field(
         default=3, ge=0,
         description="Min bond-graph distance from a charged atom for HC eligibility.",
@@ -237,6 +251,11 @@ class ContactsConfig(BaseModel):
     # Geometric cutoffs
     d_a_dist: float = Field(default=4.5, gt=0, description="D–A cutoff [Å]. PyInteraph-closest (≈ its 3.5 Å H–A).")
     angle: float = Field(default=120.0, ge=0, le=180, description="D–H–A angle cutoff [°]. PyInteraph 1 value.")
+    # MDAnalysis pairs donors with hydrogens by distance (HydrogenBondAnalysis
+    # d_h_cutoff). Its 1.2 Å default misses Cys SG–HG1 (1.32 Å), so thiol
+    # donors never bond; 1.4 Å finds them, as PyInteraph 1 does, and is still
+    # far below any non-bonded D···H distance.
+    d_h_cutoff: float = Field(default=1.4, gt=0, description="Donor–hydrogen pairing cutoff [Å] for H-bonds. 1.4 pairs Cys S–H (PyInteraph 1 does; MDAnalysis' 1.2 does not).")
     sb_cutoff: float = Field(default=4.5, gt=0, description="Salt-bridge cutoff [Å]. PyInteraph 1 --sb-co.")
     hc_cutoff: float = Field(default=5.0, gt=0, description="Hydrophobic CoM cutoff [Å]. PyInteraph 1 --hc-co.")
 
@@ -356,13 +375,14 @@ class NetworkConfig(BaseModel):
         default=0.0, ge=0.0, le=100.0,
         description="Persistency edge threshold (percent, 0..100). Weighted graphs "
                     "keep edges with combined persistency > this; unweighted graphs "
-                    "keep an edge (weight 1) where combined persistency ≥ this.",
+                    "keep an edge (weight 1) where combined persistency > this "
+                    "(strict, like PyInteraph's filter_graph).",
     )
     min_energy: float = Field(
         default=0.0, ge=0.0, le=100.0,
         description="Energy edge threshold (percent of strongest edge, 0..100). "
                     "Weighted graphs keep edges > this; unweighted graphs keep an "
-                    "edge (weight 1) where strength ≥ this.",
+                    "edge (weight 1) where strength > this.",
     )
     min_degree: int = Field(
         default=0, ge=0,
@@ -371,7 +391,8 @@ class NetworkConfig(BaseModel):
     # ── PyMOL rendering ──
     reference_pdb: Optional[Path] = Field(
         default=None,
-        description="PDB loaded in PyMOL; defaults to pipeline topology.",
+        description="PDB the .pml scripts load; default: the corrected topology "
+                    "contacts wrote (Adjacency/<name>_correct.pdb), else the topology.",
     )
     sphere_scale: float = Field(
         default=2.0, gt=0.0,
@@ -508,7 +529,14 @@ class PipelineConfig(BaseModel):
     trajectory: Optional[Path] = Field(
         default=None, description="MD trajectory (only required for `contacts`).",
     )
-    forcefield: Path = Field(description="Forcefield folder (GROMACS-style).")
+    forcefield: Optional[Path] = Field(
+        default=None,
+        description="Forcefield folder (GROMACS-style). Required by every stage that "
+                    "reads it (run, ff-reader, topology, ...): enforced in "
+                    "`build_pipeline_config` (`require_forcefield=True`, the default). "
+                    "`interactors`, `contacts`, `network` and `compare-variants` never read the "
+                    "path and opt out.",
+    )
     outpath: Path = Field(description="Root output folder for the run.")
 
     # Per-stage
@@ -580,11 +608,18 @@ def build_pipeline_config(
     *,
     config_path: Optional[Path] = None,
     overrides: Optional[dict] = None,
+    require_forcefield: bool = True,
 ) -> PipelineConfig:
     """
     Construct a PipelineConfig from optional YAML + overrides dict.
 
     `overrides` must be structured like the YAML (nested per-stage keys).
+
+    `forcefield` is optional in the model but required here by default, so every
+    stage that reads it keeps failing on a missing value exactly as before.
+    Stages that only consume the files already written under <outpath>
+    (`interactors`, `contacts`, `network`, `compare-variants`) pass
+    ``require_forcefield=False``.
     """
     base: dict = {}
     if config_path is not None:
@@ -594,13 +629,16 @@ def build_pipeline_config(
         base = _deep_merge(base, _deep_clean(overrides))
 
     try:
-        return PipelineConfig(**base)
+        cfg = PipelineConfig(**base)
     except ValidationError as e:
         msg = "Configuration validation failed:\n"
         for err in e.errors():
             loc = ".".join(str(x) for x in err["loc"])
             msg += f"  - {loc}: {err['msg']}\n"
         raise ConfigError(msg.rstrip()) from e
+    if require_forcefield and cfg.forcefield is None:
+        raise ConfigError("Configuration validation failed:\n  - forcefield: Field required")
+    return cfg
 
 class _FlowList(list):
     """A list that YAML renders inline (flow style), e.g. [OH, OG, NE2]."""
@@ -629,14 +667,42 @@ def _flow_named_rules(rules):
     return out
 
 
-def save_pipeline_config(cfg: PipelineConfig, path: Path) -> None:
+PIPELINE_PATH_KEYS = ("topology", "trajectory", "forcefield", "outpath")
+
+
+def save_pipeline_config(
+    cfg:      PipelineConfig,
+    path:     Path,
+    sections: Optional[Sequence[str]] = None,
+) -> None:
     """Serialise a PipelineConfig to YAML.
 
     The whole document is block-style, but the leaf value-lists inside
     ``interactors.named_interactors_rules`` are rendered inline so each role's
     rules stay compact and copy/paste-editable.
+
+    ``sections`` (e.g. ``["network"]``) makes the write a partial update of an
+    existing file: only those stage sections are replaced, the other sections
+    are kept as they are, and a path key (topology, trajectory, forcefield,
+    outpath) is replaced only when ``cfg`` sets it. Without this, a stage run
+    from flags alone rewrote every other stage's section with defaults and
+    dropped the forcefield path, so run_config.yaml no longer described the
+    run (a contacts run at SB 3.5 Å read back as the 4.5 Å default after
+    `network`). ``None`` writes the whole config.
     """
     data = cfg.model_dump(mode="json")
+    path = Path(path).expanduser()
+    if sections is not None and path.exists():
+        try:
+            old = load_yaml(path)
+        except ConfigError:
+            old = {}
+        for key, value in old.items():
+            if key not in data or key in sections:
+                continue          # unknown keys would fail validation anyway
+            if key in PIPELINE_PATH_KEYS and data[key] is not None:
+                continue          # a path this command was given wins
+            data[key] = value
     if isinstance(data.get("interactors"), dict) and \
             "named_interactors_rules" in data["interactors"]:
         data["interactors"]["named_interactors_rules"] = _flow_named_rules(
@@ -650,7 +716,6 @@ def save_pipeline_config(cfg: PipelineConfig, path: Path) -> None:
             "tag:yaml.org,2002:seq", seq, flow_style=True),
     )
 
-    path = Path(path).expanduser()
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w") as f:
         yaml.dump(data, f, Dumper=dumper, default_flow_style=False, sort_keys=False)

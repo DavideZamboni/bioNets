@@ -31,7 +31,7 @@ def test_config_default_is_a_deep_copy():
     # constant (and so into every later config / get_named_interactors call).
     before = copy.deepcopy(NAMED_INTERACTOR_DEFAULTS)
     cfg = InteractorsConfig()
-    cfg.named_interactors_rules["HC"][0]["resname"].append("GLY")
+    cfg.named_interactors_rules["HC"][0]["residue"].append("GLY")
     cfg.named_interactors_rules["hb_masses"].append(2)
     assert NAMED_INTERACTOR_DEFAULTS == before
     assert InteractorsConfig().named_interactors_rules == before

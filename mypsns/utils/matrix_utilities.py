@@ -27,6 +27,8 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 
+from mypsns.config import DEFAULT_NA_VALUES
+
 log = logging.getLogger(__name__)
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -284,22 +286,26 @@ def strength_to_percentage(mat: np.ndarray) -> np.ndarray:
 
 def binarize_by_threshold(mat: np.ndarray, threshold: float) -> np.ndarray:
     """
-    Unweighted edges: 1.0 where a value is present *and* meets the threshold,
-    0.0 elsewhere.
+    Unweighted edges: 1.0 where a value is present *and* strictly exceeds the
+    threshold, 0.0 elsewhere.
 
-        binary[i,j] = 1.0  if  mat[i,j] >= threshold  and  mat[i,j] > 0
+        binary[i,j] = 1.0  if  mat[i,j] > threshold  and  mat[i,j] > 0
                     = 0.0  otherwise
 
     ``mat`` is a combined per-source matrix on its own scale (persistency in
     percent 0..100, or energy in "% of the strongest edge" 0..100). The ``> 0``
-    guard keeps ``threshold == 0`` meaningful — a value of exactly 0 is a
+    guard keeps a negative threshold meaningful — a value of 0 (or below) is a
     non-contact, not an edge. The diagonal is always 0. For persistency this is
-    the residue-network analogue of PyInteraph's binary macro-IIN (an edge
-    exists iff the residue pair forms the interaction at or above the cutoff);
-    for energy it is the same idea applied to the normalised strength.
+    the residue-network analogue of PyInteraph's binary macro-IIN, and the
+    comparison is strict for the same reason: PyInteraph 1's ``filter_graph``
+    ORs ``matrix > cutoff`` over the per-type graphs, so a pair sitting exactly
+    on the cutoff is not an edge there either. It also makes the unweighted
+    edge set identical to the weighted one (which keeps values ``>`` the
+    threshold), only with weight 1. For energy it is the same idea applied to
+    the normalised strength.
     """
     out = np.zeros_like(mat, dtype=float)
-    keep = (mat >= threshold) & (mat > 0.0)
+    keep = (mat > threshold) & (mat > 0.0)
     out[keep] = 1.0
     np.fill_diagonal(out, 0.0)
     return out
@@ -414,7 +420,8 @@ def load_per_frame_energy(
             continue
         for f in files:
             df = pd.read_csv(f, usecols=['frame', 'res_1', 'res_2',
-                                         'n_contacts', 'energy_total'])
+                                         'n_contacts', 'energy_total'],
+                             na_values=DEFAULT_NA_VALUES, keep_default_na=False)
             df['target'] = target
             parts.append(df)
             log.debug('  %s: %d rows', f.name, len(df))

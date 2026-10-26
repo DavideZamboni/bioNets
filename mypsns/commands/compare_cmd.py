@@ -15,8 +15,8 @@ from ..logging_utils import (
     print_warning,
 )
 from ..utils.validation_utilities import (
-    DEFAULT_TYPES, PRESETS, VALIDATION_ROOT_ENV,
-    adjacency_paths, compare_files, preset_paths, read_label_names,
+    DEFAULT_TYPES, PRESETS,
+    adjacency_paths, compare_files, get_preset, read_label_names,
     reference_paths, write_comparison_csvs,
 )
 
@@ -43,14 +43,10 @@ def _parse_kv(items: Optional[List[str]], flag: str) -> Dict[str, str]:
 def compare(
     preset: Optional[str] = typer.Option(
         None, "--preset",
-        help=(f"Legacy dataset from the PyInteraph validation: "
-              f"{', '.join(sorted(PRESETS))}. Paths are taken under --data-root."),
-        rich_help_panel=PANEL_INPUT,
-    ),
-    data_root: Optional[Path] = typer.Option(
-        None, "--data-root",
-        help=(f"Root for --preset paths (default: ${VALIDATION_ROOT_ENV}, else "
-              "/home/davide/storage/lab_dati)."),
+        help=(f"PyInteraph reference shipped in tests/data/<preset>/: "
+              f"{', '.join(sorted(PRESETS))}. Supplies the truth side and the "
+              "per-type --max-pct-diff it is known to reach; give your run "
+              "with --computed-dir."),
         rich_help_panel=PANEL_INPUT,
     ),
     truth_dir: Optional[Path] = typer.Option(
@@ -106,7 +102,7 @@ def compare(
     max_pct_diff: Optional[List[str]] = typer.Option(
         None, "--max-pct-diff",
         help="TYPE=PCT: exit 1 if TYPE's % weight difference exceeds PCT "
-             "(e.g. SB=0.2). Repeatable.",
+             "(e.g. SB=0.2). Overrides the --preset value for TYPE. Repeatable.",
         rich_help_panel=PANEL_CHECK,
     ),
 ) -> None:
@@ -120,7 +116,8 @@ def compare(
 
     Examples:
 
-      mypsns compare --preset pyinteraph_testcase -o cmp/
+      mypsns compare --preset pyinteraph_testcase
+        --computed-dir run/Adjacency/named_interactors -o cmp/
 
       mypsns compare --truth-dir ref/ --truth-suffix _1micros
         --computed-dir run/Adjacency/named_interactors
@@ -130,21 +127,28 @@ def compare(
     """
     truth_paths: Dict[str, Path] = {}
     comp_paths:  Dict[str, Path] = {}
+    thresholds:  Dict[str, float] = {}
     if preset is not None:
         try:
-            t, c = preset_paths(preset, data_root)
+            p = get_preset(preset)
         except ValueError as e:
             print_error(str(e))
             raise typer.Exit(code=2)
-        truth_paths.update(t)
-        comp_paths.update(c)
+        if computed_dir is None and not computed_files:
+            print_error(f"--preset {preset} gives the reference graphs only: also "
+                        "pass --computed-dir <outpath>/Adjacency/<inttype>. Its "
+                        f"settings are in {p.config}.")
+            raise typer.Exit(code=2)
+        truth_paths.update(reference_paths(p.truth_dir, p.truth_suffix))
+        thresholds.update(p.max_pct_diff)
     if truth_dir is not None:
         truth_paths.update(reference_paths(truth_dir, truth_suffix))
     if computed_dir is not None:
         comp_paths.update(adjacency_paths(computed_dir))
     truth_paths.update({k: Path(v) for k, v in _parse_kv(truth_files, "--truth").items()})
     comp_paths.update({k: Path(v) for k, v in _parse_kv(computed_files, "--computed").items()})
-    thresholds = {k: float(v) for k, v in _parse_kv(max_pct_diff, "--max-pct-diff").items()}
+    user_thresholds = {k: float(v) for k, v in _parse_kv(max_pct_diff, "--max-pct-diff").items()}
+    thresholds.update(user_thresholds)
 
     wanted = list(types) if types else list(dict.fromkeys([*truth_paths, *comp_paths]))
     unpaired = [t for t in wanted if t not in truth_paths or t not in comp_paths]
@@ -185,7 +189,7 @@ def compare(
                     str(res.shared), str(res.only_truth), str(res.only_computed),
                     str(res.value_mismatch), pct, status)
     get_console().print(tbl)
-    unchecked = sorted(set(thresholds) - set(pairs))
+    unchecked = sorted(set(user_thresholds) - set(pairs))
     if unchecked:
         print_warning(f"--max-pct-diff given for types not compared: {', '.join(unchecked)}")
 
