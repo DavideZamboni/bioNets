@@ -140,6 +140,9 @@ def run_pipeline(
 
     t0 = timeit.default_timer()
 
+    # imported here, like the stage services, so `mypsns --help` stays fast
+    from ..services.topology_recognition import TopologyAssociationError  # type: ignore
+
     for stage in stages_to_run:
         try:
             _run_stage(stage, cfg, resume=resume, overwrite=overwrite)
@@ -147,6 +150,11 @@ def run_pipeline(
             # Sub-stage signalled exit (success or skip). Continue iff code 0.
             if e.exit_code not in (0, None):
                 raise
+        except TopologyAssociationError:
+            # Expected halt, not a crash: the message (unmatched residues +
+            # accept-topology commands) is already logged; a traceback would bury it.
+            print_error(f"Stage {stage} halted: some residue topologies are unmatched (see above).")
+            raise typer.Exit(code=1)
         except Exception as e:
             log.exception("Pipeline stage %s failed", stage)
             print_error(f"Stage {stage} failed: {e}")

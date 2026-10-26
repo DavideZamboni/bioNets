@@ -17,18 +17,22 @@ mypsns/
 │   ├── run_cmd.py                  ← full-pipeline orchestrator
 │   ├── ff_reader_cmd.py
 │   ├── topology_cmd.py
+│   ├── accept_topology_cmd.py      ← promote a candidate for unmatched residues
 │   ├── interactors_cmd.py
 │   ├── contacts_cmd.py
 │   ├── validate_cmd.py
 │   ├── report_cmd.py
 │   ├── guess_ff_path_cmd.py
-│   └── network_cmd.py
+│   ├── network_cmd.py
+│   ├── compare_cmd.py              ← matrix comparison vs PyInteraph (validation)
+│   └── compare_variants_cmd.py     ← ClinVar ranking (experimental, `variants` extra)
 ├── services/                       ← stage logic (one class per stage)
 │   ├── ff_reader.py
 │   ├── topology_recognition.py
 │   ├── interactors.py
 │   ├── contacts.py
 │   ├── network.py
+│   ├── compare_variants.py         ← CompareVariants(Network)
 │   └── guess_ff_path.py
 └── utils/                          ← per-stage helper functions
 ```
@@ -46,10 +50,10 @@ The CLI is layered so that each concern owns exactly one file.
 
 **`cli.py`** is the Typer app. It owns nothing but registration:
 - global options (`--verbose`, `--quiet`, `--log-file`, `--version`)
-- subcommand wiring (`run`, `ff-reader`, `topology`, `interactors`, `contacts`, `validate`, `report`, `guess_ff`, `network`)
+- subcommand wiring (`run`, `ff-reader`, `topology`, `accept-topology`, `interactors`, `contacts`, `validate`, `report`, `guess_ff`, `network`, `compare`, `compare-variants`)
 - a single entry point `main()` for the `mypsns` console script
 
-**`config.py`** is the source of truth for parameters. Every stage has a Pydantic model (`FFReaderConfig`, `TopologyConfig`, `InteractorsConfig`, `ContactsConfig`, `NetworkConfig`); `PipelineConfig` composes them. Values flow through three layers, lowest to highest priority:
+**`config.py`** is the source of truth for parameters. Every stage has a Pydantic model (`FFReaderConfig`, `TopologyConfig`, `InteractorsConfig`, `ContactsConfig`, `NetworkConfig`, `CompareVariantsConfig`); `PipelineConfig` composes them. Values flow through three layers, lowest to highest priority:
 1. Pydantic field defaults
 2. YAML file (`--config`)
 3. CLI option overrides
@@ -96,9 +100,12 @@ Individual stages (`network` is never part of `run`; it always runs on its own a
 ```bash
 mypsns ff-reader   --forcefield amber99sb.ff --outpath results/
 mypsns topology    --topology protein.pdb --forcefield amber99sb.ff --outpath results/
+mypsns accept-topology --outpath results/            # only if topology halted: list candidates, then RES=<n>
 mypsns interactors --topology protein.pdb --outpath results/
 mypsns contacts    --topology protein.pdb --trajectory traj.xtc --outpath results/ --nc 16
 mypsns network     --outpath results/ --config network.yaml
+mypsns compare     --truth-dir pyinteraph/ --computed-dir results/Adjacency/named_interactors -o cmp/
+mypsns compare-variants --config results/run_config.yaml --gene RCVRN --reference NP_002894.1
 ```
 
 Pre-flight check (no calculations):

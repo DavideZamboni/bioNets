@@ -11,6 +11,7 @@ Loading precedence (lowest → highest):
 """
 from __future__ import annotations
 
+import copy
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional
 
@@ -65,13 +66,22 @@ class TopologyConfig(BaseModel):
 # YAML-native form recorded in run_config.yaml. Each role maps to a list of
 # RULES; a rule is a dict {attribute: values} whose conditions are AND-combined,
 # and the rules in a role are OR-combined. A key prefixed with "not " negates.
-# This mirrors NAMED_INTERACTOR_DEFAULTS in interactors_utilities (kept in sync
-# by a test) so config.py need not import the heavy utilities module.
+# Values may be a list or a single string.
+#
+# This is the ONLY copy: utils/interactors_utilities.py imports it from here
+# (config.py only depends on pydantic/yaml, so the import is cheap and cannot
+# be circular). tests/test_named_interactor_defaults.py checks that. Treat it
+# as read-only — InteractorsConfig hands out a deep copy.
+#
+# Example (resname-scoped donor): {"resname": ["CYS"], "atom_name": ["SG"]}
 NAMED_INTERACTOR_DEFAULTS: Dict[str, list] = {
     # Hydrophobic side chains (PyInteraph hc_reslist); side-chain atoms only.
-    # PyInteraph's EXACT exclusion set: the CHARMM amide HN is intentionally NOT
-    # excluded (PyInteraph includes it in the side-chain COM), which is what
-    # matches HC to ~0.1%.
+    # Uses PyInteraph's EXACT exclusion set: backbone + AMBER amide H + the
+    # nter/cter oxygens it lists. The CHARMM amide HN is deliberately NOT
+    # excluded — PyInteraph includes it in the side-chain COM (it only drops
+    # 'H'), and matching that is what brings HC to ~0.1% vs PyInteraph. Met SD /
+    # Trp NE1 also stay in the COM (the HC tag is not stripped from atoms that
+    # also carry a donor/acceptor role).
     "HC": [
         {
             "resname": ["ALA", "VAL", "LEU", "ILE", "PHE", "PRO", "TRP", "MET"],
@@ -111,6 +121,7 @@ NAMED_INTERACTOR_DEFAULTS: Dict[str, list] = {
         {"resname": ["COO-"],
          "atom_name": ["C", "O1", "O2", "O", "OXT", "OT1", "OT2"]},
     ],
+    # mass(es) (rounded) of H atoms bound to a donor that count toward HBond
     "hb_masses": [1],
 }
 
@@ -180,10 +191,11 @@ class InteractorsConfig(BaseModel):
     # OR-combine across a role, and a key prefixed "not " negates. To customise:
     # copy this block from a run_config.yaml into your config, edit it, re-run
     # the interactors stage.
+    # Deep copy: a shallow one would share the inner value lists with the
+    # module-level defaults, so editing one config's rules in place would
+    # silently change the defaults for every later config.
     named_interactors_rules: Dict[str, Any] = Field(
-        default_factory=lambda: {k: [dict(r) if isinstance(r, dict) else r
-                                      for r in v] if isinstance(v, list) else v
-                                 for k, v in NAMED_INTERACTOR_DEFAULTS.items()},
+        default_factory=lambda: copy.deepcopy(NAMED_INTERACTOR_DEFAULTS),
         description="named_interactors role definitions (PyInteraph-style); "
                     "replaces the defaults when set.",
     )
@@ -414,6 +426,74 @@ class NetworkConfig(BaseModel):
             )
         return self
 
+class CompareVariantsConfig(BaseModel):
+    """Configuration for `compare-variants` (standalone, run after `network`).
+
+    Only the ClinVar query and the scoring live here. The graphs are rebuilt
+    from the `network:` section (targets, sources, weighting, thresholds,
+    min_degree, frame range), so pointing --config at the run_config.yaml that
+    `network` wrote ranks exactly the networks it built.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    # gene/reference have no meaningful default but must stay optional here:
+    # PipelineConfig builds this section for every stage. The command enforces them.
+    gene: Optional[str] = Field(
+        default=None,
+        description="Gene symbol queried in ClinVar (e.g. RCVRN). Required.",
+    )
+    reference: Optional[str] = Field(
+        default=None,
+        description=("RefSeq protein the ClinVar protein positions refer to "
+                     "(e.g. NP_002894.1), or a raw protein sequence. Required."),
+    )
+    # ── Optional GRCh38 window on top of the gene query ──
+    # ClinVar's [chrpos] search field is GRCh38; gene[gene] alone already
+    # returns every record touching the gene.
+    chrom: Optional[str] = Field(
+        default=None, description="GRCh38 window: chromosome (17 or chr17).",
+    )
+    start: Optional[int] = Field(
+        default=None, ge=1, description="GRCh38 window: first base (inclusive).",
+    )
+    stop: Optional[int] = Field(
+        default=None, ge=1, description="GRCh38 window: last base (inclusive).",
+    )
+    # ── NCBI E-utilities etiquette ──
+    email: Optional[str] = Field(
+        default=None,
+        description="Contact email sent to NCBI E-utilities (NCBI asks for one).",
+    )
+    # exclude=True: a secret, so it is never written back to run_config.yaml.
+    # Pass it with --api-key or the NCBI_API_KEY environment variable.
+    api_key: Optional[str] = Field(
+        default=None, exclude=True,
+        description="NCBI API key (10 requests/s instead of 3). Never dumped.",
+    )
+    # ── Scoring ──
+    negative: Literal["rest", "benign"] = Field(
+        default="rest",
+        description=("Negative class: 'rest' = every other residue aligned to the "
+                     "reference; 'benign' = only sites with a benign / likely-benign "
+                     "ClinVar record."),
+    )
+    min_identity: float = Field(
+        default=70.0, ge=0.0, le=100.0,
+        description=("Minimum % identity (over the structure chain) for a chain to "
+                     "be accepted as the gene's chain."),
+    )
+
+    @model_validator(mode="after")
+    def _check_window(self):
+        window = (self.chrom, self.start, self.stop)
+        if any(v is not None for v in window) and None in window:
+            raise ValueError("chrom, start and stop must be set together "
+                             "(GRCh38 window) or not at all")
+        if self.start is not None and self.stop is not None and self.stop < self.start:
+            raise ValueError(f"stop ({self.stop}) must be >= start ({self.start})")
+        return self
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Pipeline (top-level) configuration
 # ─────────────────────────────────────────────────────────────────────────────
@@ -437,6 +517,7 @@ class PipelineConfig(BaseModel):
     interactors: InteractorsConfig = Field(default_factory=InteractorsConfig)
     contacts: ContactsConfig = Field(default_factory=ContactsConfig)
     network: NetworkConfig = Field(default_factory=NetworkConfig)
+    compare_variants: CompareVariantsConfig = Field(default_factory=CompareVariantsConfig)
 
     @field_validator(
         "topology", "trajectory", "forcefield", "outpath",

@@ -117,7 +117,9 @@ def topology_recognition(
     ff_path = _resolve_ff_path(cfg.forcefield, cfg.outpath)
 
     try:
-        from ..services.topology_recognition import Topology_recognition  # type: ignore
+        from ..services.topology_recognition import (  # type: ignore
+            Topology_recognition, TopologyAssociationError,
+        )
     except ImportError as e:
         print_error(
             "Could not import `mypsns.services.topology_recognition.Topology_recognition`. "
@@ -133,12 +135,17 @@ def topology_recognition(
                 outpath=topo_out,
                 ff_path=ff_path,
                 na_values=cfg.topology_recognition.na_values,
-                outlog=str(cfg.outpath),
             )
             tr.get_restypes()
             tr.get_ff_parameters(
                 maxToCheck=cfg.topology_recognition.max_to_check,
             )
+    except TopologyAssociationError:
+        # Expected halt, not a crash: get_ff_parameters already logged the full
+        # message (unmatched residues + the accept-topology commands), so no
+        # traceback that would bury it.
+        print_error("topology halted: some residue topologies are unmatched (see above).")
+        raise typer.Exit(code=1)
     except Exception as e:
         log.exception("topology recognition failed")
         print_error(f"topology failed: {e}")

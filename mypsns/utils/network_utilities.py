@@ -22,7 +22,12 @@ _PYMOL_PALETTE: list = [
     'yellow', 'purple', 'forest', 'salmon', 'wheat', 'firebrick',
     'teal', 'hotpink', 'limegreen', 'slate',
 ]
-_PYMOL_CROSS_COLOR: str = 'gray70'   # edges spanning two communities
+
+
+def _community_colour(community_id: int) -> str:
+    """Palette colour of a community. Shared by the community spheres and the
+    intra-community edges so a community's nodes and edges always match."""
+    return _PYMOL_PALETTE[community_id % len(_PYMOL_PALETTE)]
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # PyMOL session writer
@@ -529,7 +534,8 @@ def write_graphml(
     logging.info(f'write_graphml: graph written to {out}')
     return out
 
-_PYMOL_EDGE_COLOR: str = 'gray60'   # all network edges (connectivity)
+# Edges of node_metrics renders, and cross-community edges of community renders.
+_PYMOL_EDGE_COLOR: str = 'gray60'
 
 
 def _residue_selector(chain: str, resnum: int) -> str:
@@ -597,10 +603,18 @@ def _pml_edges(
     placed:          set,
     stick_scale:     float,
     colour:          str = _PYMOL_EDGE_COLOR,
+    community_of:    Optional[Dict[int, int]] = None,
 ) -> Tuple[List[str], int]:
-    """Gray network edges as solid cylinders between per-residue pseudoatoms,
+    """Network edges as solid cylinders between per-residue pseudoatoms,
     radius scaled by edge weight. Only edges whose BOTH endpoints have a placed
     pseudoatom are drawn. Returns (lines, n_edges).
+
+    Colour: every edge is ``colour`` (gray) unless ``community_of``
+    (``{resindex: community_id}``) is given. Then an edge whose two endpoints
+    are in the same community (id >= 0) takes that community's palette colour,
+    the one its spheres use, and only the edges that cross communities stay
+    ``colour``. This makes each community read as a coloured sub-network, with
+    the gray sticks showing where communities touch.
 
     Notes on PyMOL distance objects:
       * ``color`` does NOT recolor a distance object — use ``set dash_color``.
@@ -610,13 +624,23 @@ def _pml_edges(
     """
     weights = [d.get('weight', 0.0) for _, _, d in G.edges(data=True)]
     wmax = max(weights) if weights else 0.0
-    lines: List[str] = ['# ── network edges (gray; connectivity, radius scaled by weight) ──']
+    if community_of is None:
+        header = '# ── network edges (gray; connectivity, radius scaled by weight) ──'
+    else:
+        header = ('# ── network edges (intra-community: community colour; '
+                  'cross-community: gray; radius scaled by weight) ──')
+    lines: List[str] = [header]
     n_edges = 0
     for u, v, data in G.edges(data=True):
         if int(u) not in placed or int(v) not in placed:
             continue
         w = float(data.get('weight', 0.0))
         radius = 0.05 + stick_scale * (w / wmax if wmax > 0 else 0.0)
+        edge_colour = colour
+        if community_of is not None:
+            cu = community_of.get(int(u), -1)
+            if cu >= 0 and cu == community_of.get(int(v), -1):
+                edge_colour = _community_colour(cu)
         obj = f'edge_{u}_{v}'
         lines.append(f'distance {obj}, {_point_name(u)}, {_point_name(v)}')
         lines.append(f'hide labels, {obj}')
@@ -624,7 +648,7 @@ def _pml_edges(
         lines.append(f'set dash_gap, 0.0, {obj}')
         lines.append(f'set dash_length, 1.0, {obj}')
         lines.append(f'set dash_radius, {radius:.3f}, {obj}')
-        lines.append(f'set dash_color, {colour}, {obj}')
+        lines.append(f'set dash_color, {edge_colour}, {obj}')
         n_edges += 1
     lines.append('')
     return lines, n_edges
@@ -718,8 +742,9 @@ def write_pymol_communities(
     PyMOL script rendering ONE community partition.
 
     One CA sphere per residue (uniform size), coloured by the residue's
-    community from ``community_df``. The gray network edges are drawn underneath
-    to show connectivity. No centrality scaling here — see
+    community from ``community_df``. Edges between two residues of the same
+    community take that community's colour; edges that cross communities stay
+    gray (see :func:`_pml_edges`). No centrality scaling here — see
     :func:`write_pymol_nodes`.
     '''
     outpath = Path(outpath)
@@ -728,9 +753,6 @@ def write_pymol_communities(
 
     comm_by_res = dict(zip(community_df['resindex'].astype(int),
                            community_df['community'].astype(int)))
-
-    def _colour(community_id: int) -> str:
-        return _PYMOL_PALETTE[community_id % len(_PYMOL_PALETTE)]
 
     lines = _pml_structure_header(pdb_path)
 
@@ -748,7 +770,7 @@ def write_pymol_communities(
         cid = comm_by_res.get(int(resix), -1)
         if cid < 0:                       # solitary / dissolved community → skip
             continue
-        colour = _colour(cid)
+        colour = _community_colour(cid)
         pt = _point_name(resix)
         obj = f'node_{resix}'
         lines.append(f'create {obj}, {pt}')
@@ -759,8 +781,10 @@ def write_pymol_communities(
         n_nodes += 1
     lines.append('')
 
-    # only draw edges between rendered (clustered) nodes
-    edge_lines, n_edges = _pml_edges(G, rendered, stick_scale)
+    # only draw edges between rendered (clustered) nodes; intra-community edges
+    # in the community colour, cross-community edges gray
+    edge_lines, n_edges = _pml_edges(G, rendered, stick_scale,
+                                     community_of=comm_by_res)
     lines += edge_lines
     lines += _pml_footer()
 

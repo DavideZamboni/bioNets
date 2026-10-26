@@ -15,6 +15,9 @@ import typer
 
 from .logging_utils import get_console, setup_logging
 from .commands import (
+    accept_topology_cmd,
+    compare_cmd,
+    compare_variants_cmd,
     contacts_cmd,
     ff_reader_cmd,
     interactors_cmd,
@@ -81,12 +84,15 @@ def main_callback(
 app.command(name="run",         help="Run the full pipeline.")(run_cmd.run_pipeline)
 app.command(name="ff-reader",   help="Parse a GROMACS forcefield folder.")(ff_reader_cmd.ff_reader)
 app.command(name="topology",    help="Match topology residues against the forcefield.")(topology_cmd.topology_recognition)
+app.command(name="accept-topology", help="Promote a proposed candidate for residues `topology` could not match.")(accept_topology_cmd.accept_topology)
 app.command(name="interactors", help="Assign interaction roles to topology atoms.")(interactors_cmd.interactors)
 app.command(name="contacts",    help="Compute contacts across an MD trajectory.")(contacts_cmd.contacts)
 app.command(name="validate",    help="Validate a config and its referenced files.")(validate_cmd.validate)
 app.command(name="report",      help="Summarise outputs in a run folder.")(report_cmd.report)
 app.command(name="guess_ff",    help="Guesses possible forcefield subfolders.")(guess_ff_path_cmd.guess_ff_path)
 app.command(name="network",    help="Network construction and subsequent analyses.")(network_cmd.network)
+app.command(name="compare",    help="Compare residue matrices with reference (e.g. PyInteraph) graphs.")(compare_cmd.compare)
+app.command(name="compare-variants", help="Rank network metrics against ClinVar pathogenicity (experimental).")(compare_variants_cmd.compare_variants)
 
 def main() -> None:
     """Console-script entry point."""

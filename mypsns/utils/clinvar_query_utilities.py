@@ -1,30 +1,34 @@
 """
-clinvar_query.py — query ClinVar by gene (+ optional genomic location) → DataFrame.
+clinvar_query_utilities.py — query ClinVar by gene (+ optional genomic window)
+and fetch RefSeq protein sequences, through NCBI E-utilities only.
 
-Three approaches, most-robust first:
-  1. clinvar_via_eutilities()  — NCBI E-utilities API   (RECOMMENDED)
-  2. clinvar_via_requests()    — parse the server-rendered results page (no browser)
-  3. clinvar_via_selenium()    — drive a real browser   (what you asked for)
+Why E-utilities and not the web page: NCBI asks programmatic users to use the
+API (the web UI rate-limits/blocks scrapers and its HTML changes without
+notice), and the API returns structured records you don't have to scrape.
 
-Why the API first: the ClinVar results page is server-rendered, so Selenium is
-rarely necessary, and for programmatic access NCBI explicitly asks you to use
-E-utilities (the web UI rate-limits/blocks scrapers and its HTML changes without
-notice). The API returns structured records you don't have to scrape.
+  fetch_clinvar_variants()   esearch → esummary, one row per VCV record
+                             (used by services/compare_variants.py)
+  fetch_reference_protein()  efetch a protein FASTA → sequence
+  suggest_refseq_protein()   most-cited NM_ transcript in a variants table
+  clinvar_via_eutilities()   older standalone variant of fetch_clinvar_variants
+                             with a richer, assembly-aware parser
+                             (parse_clinvar_summary); not used by the CLI.
+
+The ClinVar `[chrpos]` search field is GRCh38 (GRCh37 would be `[chrpos37]`),
+so the optional chrom/start/stop window is always in GRCh38 coordinates.
 
 NCBI rate limits: 3 requests/s without an API key, 10/s with one. Pass
 api_key=... (free, from your NCBI account) and email=... to be polite.
 
-Deps:  pip install requests pandas lxml          # + selenium for approach 3
+Deps: requests (optional `variants` extra: pip install -e .[variants])
 """
 from __future__ import annotations
 import time
-import urllib.parse
 import requests
 import pandas as pd
 import re
 
-EUTILS  = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
-CLINVAR = "https://www.ncbi.nlm.nih.gov/clinvar/"
+EUTILS = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
 
 # ── ClinVar via E-utilities ─────────────────────────────────────────────
 def _eutils(endpoint: str, params: dict, email=None, api_key=None,
@@ -41,7 +45,13 @@ def _eutils(endpoint: str, params: dict, email=None, api_key=None,
 def fetch_clinvar_variants(gene, chrom=None, start=None, stop=None,
                            assembly="GRCh38", email=None, api_key=None,
                            retmax=2000, pause=0.34) -> pd.DataFrame:
-    """esearch → esummary (JSON), one row per ClinVar VCV record."""
+    """esearch → esummary (JSON), one row per ClinVar VCV record.
+
+    `gene[gene]` alone already returns every record touching the gene; the
+    optional chrom/start/stop window (all three or none) is a GRCh38 filter on
+    top. `assembly` is not used by the search (`[chrpos]` is always GRCh38) and
+    is kept only for signature compatibility.
+    """
     term = f"{gene}[gene]"
     if chrom and start and stop:
         c = str(chrom).lower().replace("chr", "")
@@ -69,7 +79,9 @@ def fetch_reference_protein(accession, email=None, api_key=None) -> str:
                    if l and not l.startswith(">"))
 
 def suggest_refseq_protein(variants_df) -> str | None:
-    """Most-cited NM_ transcript in the records (its NP_ is the reference)."""
+    """Best-effort: the RefSeq transcript (NM_) most cited in the ClinVar
+    'name' column. The matching protein is its NP_; pass that NP_ (or a UniProt
+    sequence) to the aligner. Returns the most common NM_ accession or None."""
     accs = [m.group(1) for nm in variants_df.get("name", pd.Series([], dtype=str)).fillna("")
             for m in [re.search(r"\b(NM_\d+\.\d+)", nm)] if m]
     return pd.Series(accs).mode().iloc[0] if accs else None
@@ -137,35 +149,7 @@ def parse_clinvar_summary(rec: dict, assembly="GRCh38") -> dict:
     }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Reference protein sequence (RefSeq protein the ClinVar positions refer to)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def suggest_refseq_protein(variants_df):
-    """Best-effort: pull the RefSeq transcript (NM_) most cited in the ClinVar
-    'name' column. The matching protein is its NP_; pass that NP_ (or a UniProt
-    sequence) to the aligner. Returns the most common NM_ accession or None."""
-    accs = []
-    for nm in variants_df.get("name", pd.Series([], dtype=str)).fillna(""):
-        m = re.search(r"\b(NM_\d+\.\d+)", nm)
-        if m:
-            accs.append(m.group(1))
-    return pd.Series(accs).mode().iloc[0] if accs else None
-
-def fetch_reference_protein(accession, email=None, api_key=None):
-    """efetch a protein FASTA (e.g. 'NP_002894.1') -> sequence string."""
-    params = {"db": "protein", "id": accession, "rettype": "fasta",
-              "retmode": "text", "tool": "variant_metric_ranking"}
-    if email:
-        params["email"] = email
-    if api_key:
-        params["api_key"] = api_key
-    r = requests.get(f"{EUTILS}/efetch.fcgi", params=params, timeout=30)
-    r.raise_for_status()
-    lines = r.text.splitlines()
-    return "".join(l.strip() for l in lines if l and not l.startswith(">"))
-
-# ─────────────────────────────────────────────────────────────────────────────
-# E-utilities clinvar API 
+# E-utilities clinvar API
 # ─────────────────────────────────────────────────────────────────────────────
 def clinvar_via_eutilities(gene, chrom=None, start=None, stop=None,
                            assembly="GRCh38", api_key=None, email=None,

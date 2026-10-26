@@ -42,69 +42,24 @@ import networkx as nx
 import MDAnalysis as mda
 import logging
 
+from mypsns.config import NAMED_INTERACTOR_DEFAULTS
+
 log = logging.getLogger(__name__)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Named-interactor (PyInteraph-style) role definitions
 # ═══════════════════════════════════════════════════════════════════════════════
-# Each role maps to a list of RULES. A rule is a dict {attribute: values}; all
-# conditions in one dict are AND-combined, and the rules in a role are OR-combined
-# (an atom matches the role if it satisfies ANY rule). A condition key prefixed
-# with "not " negates it. Values may be a list or a single string. This is the
-# YAML-native form recorded in run_config.yaml and overridable from config; it is
-# converted to the internal (attr, values) grammar by `_rules_from_config`.
-#
-# Example (resname-scoped donor): {"resname": ["CYS"], "atom_name": ["SG"]}
-NAMED_INTERACTOR_DEFAULTS: Dict[str, list] = {
-    # Hydrophobic side chains (PyInteraph hc_reslist); side-chain atoms only.
-    # Uses PyInteraph's EXACT exclusion set: backbone + AMBER amide H + the
-    # nter/cter oxygens it lists. The CHARMM amide HN is deliberately NOT
-    # excluded — PyInteraph includes it in the side-chain COM (it only drops
-    # 'H'), and matching that is what brings HC to ~0.1% vs PyInteraph. Met SD /
-    # Trp NE1 also stay in the COM (HC tag no longer stripped, see below).
-    "HC": [
-        {
-            "resname": ["ALA", "VAL", "LEU", "ILE", "PHE", "PRO", "TRP", "MET"],
-            "not atom_name": ["N", "CA", "C", "O", "H", "H1", "H2", "H3",
-                              "O1", "O2", "OXT"],
-        },
-    ],
-    # hydrogen_bonds.ini DONORS
-    "HDon": [
-        {"atom_name": ["OH", "OG", "NE2", "OG1", "NE", "N", "ND1", "NZ",
-                       "NH1", "NH2", "OW", "ND2", "SG", "OH2", "NE1"]},
-    ],
-    # hydrogen_bonds.ini ACCEPTORS
-    "HAcc": [
-        {"atom_name": ["OH", "OG", "OD1", "OD2", "OG1", "O", "ND1", "NE2",
-                       "OE2", "OW", "SG", "OE1", "OH2", "SD"]},
-    ],
-    # charged_groups.ini POSITIVE groups (*p). His is included but only acts as
-    # basic when protonated — enforced by the net-charge gate (min_residue_charge),
-    # so neutral His does not form salt bridges.
-    "Basic": [
-        {"resname": ["NH3+", "GLY-NH3+", "NHT3+", "PRO-NH2+"],
-         "atom_name": ["N", "H1", "H2", "H3", "HT1", "HT2", "HT3"]},
-        {"resname": ["ARG"],
-         "atom_name": ["CD", "NE", "CZ", "NH1", "HH11", "HH12",
-                       "NH2", "HH21", "HH22"]},
-        {"resname": ["HIS", "HSD", "HSE", "HSP", "HSA", "HSB",
-                     "HIS1", "HISH", "HID", "HIE", "HIP"],
-         "atom_name": ["CG", "ND1", "HD1", "CD2", "CE1", "NE2", "HE2"]},
-        {"resname": ["LYS", "LYSH"],
-         "atom_name": ["CE", "NZ", "HZ1", "HZ2", "HZ3"]},
-    ],
-    # charged_groups.ini NEGATIVE groups (*n) + C-terminus (all oxygen variants)
-    "Acidic": [
-        {"resname": ["ASP"], "atom_name": ["CG", "OD1", "OD2"]},
-        {"resname": ["GLU"], "atom_name": ["CD", "OE1", "OE2"]},
-        {"resname": ["COO-"],
-         "atom_name": ["C", "O1", "O2", "O", "OXT", "OT1", "OT2"]},
-    ],
-    # mass(es) (rounded) of H atoms bound to a donor that count toward HBond
-    "hb_masses": [1],
-}
+# NAMED_INTERACTOR_DEFAULTS lives in mypsns/config.py (single source of truth;
+# it used to be duplicated here and kept in sync by hand). Each role maps to a
+# list of RULES. A rule is a dict {attribute: values}; all conditions in one
+# dict are AND-combined, and the rules in a role are OR-combined (an atom
+# matches the role if it satisfies ANY rule). A condition key prefixed with
+# "not " negates it. This is the YAML-native form recorded in run_config.yaml
+# and overridable from config; it is converted to the internal (attr, values)
+# grammar by `_rules_from_config`. get_named_interactors deep-copies it before
+# use, so the shared constant is never mutated. Imported above and
+# re-exported from this module for existing callers.
 
 # Roles evaluated as selection rules (everything except the scalar hb_masses).
 NAMED_INTERACTOR_ROLES: List[str] = ["HC", "HDon", "HAcc", "Basic", "Acidic"]

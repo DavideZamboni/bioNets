@@ -703,9 +703,10 @@ class Network:
             <inttype>/node_metrics/<source>_<metric>.pml
             <inttype>/community_metrics/<source>_<method>.pml
 
-        Each node-metric file shows CA spheres scaled by that one metric; each
-        community file shows CA spheres coloured by that one partition. Both
-        always draw the gray network edges underneath for connectivity. Node and
+        Each node-metric file shows CA spheres scaled by that one metric, with
+        gray network edges for connectivity. Each community file shows CA
+        spheres coloured by that one partition; its intra-community edges take
+        the community colour and cross-community edges stay gray. Node and
         community renders are independent, so the count is
         (metrics + methods) per (inttype × source), not their product.
         """

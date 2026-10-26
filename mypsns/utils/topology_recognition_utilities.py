@@ -9,7 +9,25 @@ import logging
 
 log = logging.getLogger(__name__)
 
-## 
+##
+
+_ATOMS_SUFFIX = '_atoms.csv'
+
+def topology_key(atoms_file: str) -> str:
+    '''
+    Name of a residue topology from its resid_topologies file:
+    "MET_1_atoms.csv" -> "MET_1". The key names the topology in every later
+    file (found_topologies/<key>_ff_atoms.csv,
+    possible_topologies/<key>_uncertain_atoms_<n>.csv) and is what
+    `mypsns accept-topology` takes on the command line.
+
+    Strips the exact suffix. The old str.rstrip("_atoms.csv") stripped a
+    character SET instead, so a key ending in any of "_atomscv." lost those
+    letters too (e.g. "Na_atoms.csv" -> "N").
+    '''
+    if atoms_file.endswith(_ATOMS_SUFFIX):
+        return atoms_file[:-len(_ATOMS_SUFFIX)]
+    return atoms_file
 
 def get_residue_types(top_df: pd.DataFrame, res_topology_folder: Path) -> pd.DataFrame:
     # Iterate over each resname
@@ -571,7 +589,8 @@ def save_results(out : Path, found_residues: dict, best_choices: dict, nas: list
     complete_match = True
     unmatched: list = []   # residues with no perfect forcefield match (halts pipeline)
     for ix, row in different_residue_topologies.iterrows():
-        unique_top_resname = different_residue_topologies.loc[ix, "atoms"].rstrip("_atoms.csv")
+        atoms_file = different_residue_topologies.loc[ix, "atoms"]
+        unique_top_resname = topology_key(atoms_file)
         resname = different_residue_topologies.loc[ix, 'resname']
         if unique_top_resname in found_residues.keys():
             ff_topology_name = unique_top_resname + "_ff_atoms.csv"
@@ -584,12 +603,18 @@ def save_results(out : Path, found_residues: dict, best_choices: dict, nas: list
         elif unique_top_resname in best_choices.keys():
             complete_match = False
             possile_tops_str = ""
-            matching_ats = best_choices[unique_top_resname][0][0]
-            total_ats = best_choices[unique_top_resname][0][1].shape[0]
-            unmatching_ats = total_ats - matching_ats
-            log.warning('No perfect match for residue %s (%s): %s/%s atom names matched, %s proposed alternative(s)',
+            candidates = best_choices[unique_top_resname]
+            # The candidates' score is not a count: it is 0 when the leftover
+            # (differently named) atoms match by mass and -inf otherwise (see
+            # check_masses). Count the shared atom names directly, taking the
+            # best candidate, so the report says how close the match is.
+            top_atnames = pd.read_csv(out / 'resid_topologies' / atoms_file, header = 0, index_col = False,
+                                      na_values = nas, keep_default_na = False)['name'].astype(str).tolist()
+            matching_ats = max(len(set(top_atnames) & set(c[1]['atom_name'].astype(str))) for c in candidates)
+            total_ats = len(top_atnames)
+            log.warning('No perfect match for residue %s (%s): best candidate shares %s/%s atom names, %s proposed alternative(s)',
                         resname, unique_top_resname,
-                        matching_ats, total_ats, unmatching_ats)
+                        matching_ats, total_ats, len(candidates))
             for count in range(len(best_choices[unique_top_resname])):
                 ff_topology_name = unique_top_resname + f"_uncertain_atoms_{count}.csv"
                 possile_tops_str += f"{ff_topology_name} "
@@ -597,25 +622,38 @@ def save_results(out : Path, found_residues: dict, best_choices: dict, nas: list
 
             different_residue_topologies.loc[ix, "possible_atoms"] = possile_tops_str
             unmatched.append({'resname': resname, 'topology': unique_top_resname,
-                              'matched_atoms': matching_ats, 'total_atoms': total_ats})
+                              'matched_atoms': matching_ats, 'total_atoms': total_ats,
+                              'n_candidates': len(candidates)})
         else:
             # residue neither perfectly matched nor with any proposed alternative
             complete_match = False
             log.warning('No forcefield candidate at all for residue %s (%s)',
                         resname, unique_top_resname)
             unmatched.append({'resname': resname, 'topology': unique_top_resname,
-                              'matched_atoms': None, 'total_atoms': None})
+                              'matched_atoms': None, 'total_atoms': None,
+                              'n_candidates': 0})
 
     if complete_match:
         oname = "complete_residue_topologies.csv"
+        stale = "unmatching_residue_topologies.csv"
         columns = different_residue_topologies.columns.to_list()
         columns.remove('possible_atoms')
     else:
         oname = "unmatching_residue_topologies.csv"
+        stale = "complete_residue_topologies.csv"
         columns = different_residue_topologies.columns.to_list()
 
     different_residue_topologies.to_csv(out / oname, header = True, columns=columns, index = False)
     log.debug('save_results: wrote %s (complete_match=%s)', oname, complete_match)
+
+    # Only the outcome of THIS run may be on disk. A complete_residue_topologies.csv
+    # left by an earlier run (or an earlier accept-topology) would let the
+    # interactors stage run on stale associations after this run halted, and a
+    # stale unmatching file would offer accept-topology candidates that no
+    # longer exist.
+    if (out / stale).exists():
+        (out / stale).unlink()
+        log.info('Removed %s left over from a previous run', stale)
     return complete_match, unmatched
 
 def associate_ff_params(ff: Path, out: Path, nas: list, maxToCheck: int) -> Tuple[bool, list]:
@@ -648,7 +686,7 @@ def associate_ff_params(ff: Path, out: Path, nas: list, maxToCheck: int) -> Tupl
 
     ### ITERATE OVER ALL POSSIBLE RESIDUE TOPOLOGIES (RESIDUES WITH SAME SET OF ATOMS) IN TOPOLOGY
     for at_path, topres_df in restypes.groupby(by = 'atoms'):
-        top_residuename = at_path.rstrip("_atoms.csv")
+        top_residuename = topology_key(at_path)
         top_atoms_df = pd.read_csv(out / "resid_topologies" / at_path, header = 0, index_col = False, na_values = nas)
         # results: dictionary:
         #  - keys: residue names found in topology
@@ -681,3 +719,141 @@ def associate_ff_params(ff: Path, out: Path, nas: list, maxToCheck: int) -> Tupl
     found_residues, best_choices = collect_results(results)
 
     return save_results(out, found_residues, best_choices, nas)
+
+## Functions used by `mypsns accept-topology`: promote a proposed candidate
+## (possible_topologies/) to the residue's forcefield topology (found_topologies/)
+## after recognition halted on residues with no exact match.
+
+UNMATCHED_TABLE = 'unmatching_residue_topologies.csv'
+COMPLETE_TABLE = 'complete_residue_topologies.csv'
+
+# Columns of every per-residue forcefield CSV (as get_results / check_ters write
+# them). A hand-edited replacement must keep all of them: the interactors stage
+# reads bonds, charges and chargegroups from it and contacts reads masses and
+# the LJ sigma/epsilon used for the energy matrices.
+FF_ATOM_COLUMNS = ['rtp_file', 'resname', 'atom_name', 'atom_type', 'charge',
+                   'chargegroup', 'bonds', 'sigma', 'epsilon', 'mass']
+
+# Max |mass difference| (amu) for a renamed atom pair to count as the same atom.
+# The structure's masses can be MDAnalysis guesses (O 15.999 against the
+# forcefield's 15.9994), so exact equality is too strict, while the smallest gap
+# that matters (H 1.008 against D 2.014) is far above it.
+MASS_TOLERANCE = 0.1
+
+def read_str_csv(path: Path, nas: list) -> pd.DataFrame:
+    '''
+    Read a topology CSV with every column as a string, so that rewriting it
+    changes only the cells we edit (no float reformatting). keep_default_na=False
+    keeps pandas' default "NA" from turning sodium names into NaN; only the
+    configured na_values count as missing.
+    '''
+    return pd.read_csv(path, header = 0, index_col = False, dtype = str,
+                       na_values = nas, keep_default_na = False)
+
+def read_topology_table(path: Path, nas: list) -> pd.DataFrame:
+    '''
+    Read a *_residue_topologies.csv. The ff_atoms, possible_atoms and
+    accepted_from columns come back as '' when empty (or absent:
+    accepted_from only exists once accept-topology has run).
+    '''
+    table = read_str_csv(path, nas)
+    for col in ('ff_atoms', 'possible_atoms', 'accepted_from'):
+        if col not in table.columns:
+            table[col] = ''
+        table[col] = table[col].fillna('')
+    return table
+
+def candidate_files(row: pd.Series) -> List[str]:
+    '''File names (in possible_topologies/) of the candidates proposed for one
+    row of unmatching_residue_topologies.csv, in index order.'''
+    return [f for f in str(row['possible_atoms']).split() if f]
+
+def candidate_index(candidate_file: str) -> int:
+    '''"MET_1_uncertain_atoms_3.csv" -> 3, the number accept-topology takes.'''
+    return int(candidate_file[:-len('.csv')].rsplit('_', 1)[1])
+
+def pair_candidate_atoms(top_atoms: pd.DataFrame, cand: pd.DataFrame) -> pd.DataFrame:
+    '''
+    Pair every atom of a forcefield candidate with an atom of the structure
+    residue, the way recognition scored the candidate (check_namemasses and
+    check_masses): atoms with the same name pair with each other, and the
+    remaining candidate atoms pair with the remaining structure atoms BY
+    POSITION, each side in its own file order.
+
+     - top_atoms: resid_topologies/<key>_atoms.csv (columns name, mass)
+     - cand: candidate forcefield topology (columns atom_name, mass, ...)
+
+    Returns one row per candidate atom, in candidate order: ff_name, top_name,
+    ff_mass, top_mass, renamed (the names differ) and mass_ok
+    (|ff_mass - top_mass| <= MASS_TOLERANCE). Raises ValueError when the two
+    sides cannot be paired at all (different atom counts, duplicated names).
+    '''
+    top_names = top_atoms['name'].astype(str).tolist()
+    ff_names = cand['atom_name'].astype(str).tolist()
+    if len(top_names) != len(ff_names):
+        raise ValueError(f'the candidate has {len(ff_names)} atoms, '
+                         f'the structure residue {len(top_names)}')
+    for side, names in (('structure residue', top_names), ('candidate', ff_names)):
+        duplicated = sorted({n for n in names if names.count(n) > 1})
+        if duplicated:
+            raise ValueError(f'duplicated atom names in the {side}: {duplicated}')
+
+    top_mass = dict(zip(top_names, top_atoms['mass'].astype(float)))
+    shared = set(top_names) & set(ff_names)
+    # same counts and no duplicates -> both leftover lists have the same length
+    top_left = iter([n for n in top_names if n not in shared])
+    rows = []
+    for ff_name, ff_mass in zip(ff_names, cand['mass'].astype(float)):
+        top_name = ff_name if ff_name in shared else next(top_left)
+        rows.append({'ff_name': ff_name, 'top_name': top_name,
+                     'ff_mass': ff_mass, 'top_mass': top_mass[top_name]})
+    pairs = pd.DataFrame(rows)
+    pairs['renamed'] = pairs['ff_name'] != pairs['top_name']
+    pairs['mass_ok'] = (pairs['ff_mass'] - pairs['top_mass']).abs() <= MASS_TOLERANCE
+    return pairs
+
+def rename_candidate_atoms(cand: pd.DataFrame, renames: dict) -> pd.DataFrame:
+    '''
+    Give the candidate's atoms the structure's names ({ff_name: structure_name}),
+    in atom_name AND in every bonds string. The renamed topology is what the
+    interactors stage stores, and contacts joins it with the structure on
+    (Resindex, atom_name): an atom name the structure does not have makes that
+    join fail.
+
+    Bond tokens prefixed with "-" or "+" name an atom of the previous / next
+    residue, whose names are not ours to change, so they are left alone. A
+    bonds string with no renamed atom is kept byte for byte.
+    '''
+    renamed = cand.copy()
+    renamed['atom_name'] = renamed['atom_name'].map(lambda n: renames.get(n, n))
+
+    def _rename_bonds(bonds):
+        if not isinstance(bonds, str):
+            return bonds
+        tokens = bonds.split()
+        if not any(t in renames for t in tokens):
+            return bonds
+        return ' '.join(renames.get(t, t) for t in tokens)
+
+    renamed['bonds'] = renamed['bonds'].map(_rename_bonds)
+    return renamed
+
+def dangling_bonds(ff_atoms: pd.DataFrame) -> dict:
+    '''
+    {atom_name: [bond partners that are not atoms of this residue]}, ignoring
+    "-" / "+" tokens (atoms of the previous / next residue).
+
+    After a hand edit, a non-empty result usually means atom_name was changed
+    but the bonds column was not. It is only a warning: recognition's own
+    terminal patching can leave such names too (e.g. an NHT3+ N-terminus whose
+    N lists "H1 H2 H3" while its atoms are HT1-HT3).
+    '''
+    names = set(ff_atoms['atom_name'].astype(str))
+    dangling = {}
+    for atom, bonds in zip(ff_atoms['atom_name'].astype(str), ff_atoms['bonds']):
+        if not isinstance(bonds, str):
+            continue
+        unknown = [b for b in bonds.split() if b[0] not in '-+' and b not in names]
+        if unknown:
+            dangling[atom] = unknown
+    return dangling

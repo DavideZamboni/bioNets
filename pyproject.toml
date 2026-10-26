@@ -51,8 +51,9 @@ include-package-data = true
 # mypsns = "mypsns.main:main"
 
 [project.optional-dependencies]
-# ClinVar variant-vs-network-metric comparison (services/compare_variants.py).
-# Experimental and not wired into the CLI yet.
+# ClinVar variant-vs-network-metric comparison: `mypsns compare-variants`
+# (services/compare_variants.py). Experimental; the command exits with an
+# install hint when these are missing.
 variants = [
     "requests",
     "biopython",
@@ -62,3 +63,6 @@ dev = [
     "black",
     "ruff"
 ]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

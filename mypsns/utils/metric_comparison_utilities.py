@@ -5,8 +5,6 @@ import pandas as pd
 import networkx as nx
 import re
 
-EUTILS = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
-
 # ── residue → 1-letter coding (inlined; Biopython is used only for alignment) ─
 # A 26-entry lookup doesn't justify importing Biopython's Data submodule (and
 # coupling to its internals). The standard 20 + IUPAC ambiguity codes (B/X/Z/J/
@@ -33,9 +31,15 @@ def res3to1(resname: str) -> str:
     return _THREE2ONE.get((resname or "").strip().upper(), "X")
 
 # ── structure sequences from the interactor table (Entity-driven) ────────
-def chain_sequences(int_top: pd.DataFrame, resindex_to_pdb: Dict[int, Tuple[str, int]]) -> Dict[str, List[int]]:
-    """{chain: [(resindex, resid, resname, aa1)]} for polymeric residues
-    only (Entity == 'P'), ordered along the chain. No ion/water blocklist."""
+def chain_sequences(int_top: pd.DataFrame,
+                    resindex_to_pdb: Dict[int, Tuple]) -> Dict[str, List[Tuple[int, int, str, str]]]:
+    """{chain: [(resindex, resnum, resname, aa1)]} for polymeric residues
+    only (Entity == 'P'), ordered along the chain. No ion/water blocklist.
+
+    `resnum` is the input topology's residue number (residue_index.csv), the
+    one a user sees in their PDB. The resindex_to_pdb map is only a fallback:
+    it is built from the corrected PDB Contacts writes, where resid == Resindex.
+    """
     res = int_top.drop_duplicates("Resindex")
     res = res[res["Entity"] == "P"]
     chains = {}
@@ -44,8 +48,9 @@ def chain_sequences(int_top: pd.DataFrame, resindex_to_pdb: Dict[int, Tuple[str,
         out = []
         for _, r in grp.iterrows():
             rix = int(r["Resindex"])
-            resid = resindex_to_pdb.get(rix, (ch, r.get("resnum", rix)))[1]
-            out.append((rix, int(resid), r["resname"], res3to1(r["resname"])))
+            resnum = (r["resnum"] if pd.notna(r.get("resnum"))
+                      else resindex_to_pdb.get(rix, (ch, rix))[1])
+            out.append((rix, int(resnum), r["resname"], res3to1(r["resname"])))
         chains[ch] = out
     return chains
 
@@ -60,7 +65,7 @@ def map_reference_positions(int_top, resindex_to_pdb, ref_seq, min_identity=70.0
     aligner.mode = "global"
     best = (None, {}, -1.0)
     chain_seqs = chain_sequences(int_top, resindex_to_pdb)
-    for ch, residues in chain_seqs:
+    for ch, residues in chain_seqs.items():
         s_seq = "".join(x[3] for x in residues)
         if not s_seq:
             continue
@@ -133,6 +138,12 @@ def node_metric_table(G: nx.Graph, cdf: pd.DataFrame) -> pd.DataFrame:
                               "edge_weight_mean": ef.mean(),
                               "edge_weight_max": ef.max()}).reset_index()
         cdf = cdf.merge(feats, on="resindex", how="left")
+        # Isolated nodes have no edge rows: their edge features are 0, not
+        # missing. Left as NaN, score() would drop them from the edge-feature
+        # rankings only, so node and edge rows would be scored on different sites.
+        cols = ["edge_strength", "edge_count", "edge_weight_mean", "edge_weight_max"]
+        cdf[cols] = cdf[cols].fillna(0)
+        cdf["edge_count"] = cdf["edge_count"].astype(int)
     return cdf
 
 # missense truth table builder
@@ -157,6 +168,9 @@ def missense_truth_table(variants_df: pd.DataFrame) -> pd.DataFrame:
                      "label": "non_benign" if npath else "benign" if nben else "vus"})
     return pd.DataFrame(rows).set_index("ref_pos").sort_index()
 
+SCORE_COLUMNS = ["metric", "kind", "auroc", "auroc_oriented", "direction",
+                 "auprc", "mwu_p", "n_pos", "n_neg"]
+
 def score(merged, negative, NODE_METRICS: List[str], EDGE_FEATURES: List[str]) -> pd.DataFrame:
     from scipy.stats import mannwhitneyu
     pos = merged["label"].eq("non_benign")
@@ -179,5 +193,8 @@ def score(merged, negative, NODE_METRICS: List[str], EDGE_FEATURES: List[str]) -
                     "direction": "higher" if auroc >= 0.5 else "lower",
                     "auprc": round(_auprc(xs, y), 3), "mwu_p": p,
                     "n_pos": int(y.sum()), "n_neg": int((y == 0).sum())})
-    return (pd.DataFrame(out).sort_values("auroc_oriented", ascending=False)
+    # Explicit columns so a graph with no scoreable metric (e.g. a gene with no
+    # pathogenic missense sites) still yields an empty table with a header.
+    return (pd.DataFrame(out, columns=SCORE_COLUMNS)
+            .sort_values("auroc_oriented", ascending=False)
             .reset_index(drop=True))
